@@ -467,8 +467,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         size != shm->size) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
-                   << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size << ", need size: " << shm->size;
+            << buffer << ", need addr: " << shm->base_addr
+            << ", buffer size: " << size << ", need size: " << shm->size;
         return -1;
     }
 
@@ -687,6 +687,23 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
                                                                   client_id_);
     };
     return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
+}
+
+int64_t DummyClient::get_buffer_range(const std::string& key, void* dest_buffer,
+                                      size_t dest_offset, size_t source_offset,
+                                      size_t size) {
+    (void)key;
+    (void)dest_buffer;
+    (void)dest_offset;
+    (void)source_offset;
+    (void)size;
+    return -1;  // TODO: not supported for dummy client
+}
+
+std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
+    const std::string& key) {
+    (void)key;
+    return {0, 0};  // TODO: implement for dummy client
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(

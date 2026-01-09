@@ -261,6 +261,26 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
+     * @brief Get a range of data from a key into a destination buffer
+     * @param key Key to get data for
+     * @param dest_buffer Destination buffer to write data to
+     * @param dest_offset Offset in destination buffer to write data
+     * @param source_offset Offset in source object to read data from
+     * @param size Number of bytes to read
+     * @return Number of bytes read on success, or negative error code on failure
+     */
+    int64_t get_buffer_range(const std::string &key, void *dest_buffer,
+                             size_t dest_offset, size_t source_offset,
+                             size_t size);
+
+    /**
+     * @brief Get buffer information (address and size) for a key
+     * @param key Key to get buffer information for
+     * @return Tuple containing buffer address and size, or (0, 0) if error
+     */
+    std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
+
+    /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
      * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
@@ -627,6 +647,10 @@ class RealClient : public PyClient {
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
+
+    tl::expected<int64_t, ErrorCode> get_buffer_range_internal(
+        const std::string &key, void *dest_buffer, size_t dest_offset,
+        size_t source_offset, size_t size);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,

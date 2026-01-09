@@ -234,7 +234,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         # 2. Batch Get per Rank
         all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
         for rank in range(tp_size):
-            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
 
@@ -550,7 +550,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         # 2. Batch Get per Rank
         all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
         for rank in range(tp_size):
-            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
 
@@ -641,7 +641,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             # Measure TP Get (Simulating gathering all ranks)
             t_get_start = time.perf_counter()
             for rank in range(tp_size):
-                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
                 self.assertEqual(len(res), len(self.tensors))
             get_times.append(time.perf_counter() - t_get_start)
 
@@ -754,7 +754,8 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                     rank_buffers[rank]['ptrs'],
                     rank_buffers[rank]['sizes'],
                     tp_rank=rank,
-                    tp_size=tp_size
+                    tp_size=tp_size,
+                    split_dim=split_dim
                 )
                 self.assertEqual(len(res), batch_size)
                 all_res.append(res)
@@ -822,7 +823,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             # Measure TP Get (Simulating gathering all ranks)
             t_get_start = time.perf_counter()
             for rank in range(tp_size):
-                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
                 self.assertEqual(len(res), len(self.tensors))
             get_times.append(time.perf_counter() - t_get_start)
 

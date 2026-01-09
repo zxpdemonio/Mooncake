@@ -383,7 +383,9 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code);
+                                         TransferRequest::OpCode op_code,
+                                         size_t source_offset = 0,
+                                         size_t dest_offset = 0);
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -426,28 +428,45 @@ class TransferSubmitter {
      * @brief Validate transfer parameters
      */
     bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
-                                const std::vector<Slice>& slices) const;
+                                const std::vector<Slice>& slices,
+                                TransferRequest::OpCode op_code,
+                                size_t source_offset,
+                                size_t dest_offset) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
+     * @param handle Buffer descriptor
+     * @param slices Vector of slices to transfer
+     * @param op_code Operation code (READ or WRITE)
+     * @param source_offset Offset in source buffer (for READ operations)
+     * @param dest_offset Offset in destination buffer (for WRITE operations)
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
-        uint64_t src_offset = 0);
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code,
+        size_t source_offset = 0,
+        size_t dest_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
-     * @param src_offset Optional offset in source buffer (default 0)
+     * @param handle Buffer descriptor
+     * @param slices Vector of slices to transfer
+     * @param op_code Operation code (READ or WRITE)
+     * @param source_offset Offset in source buffer (for READ operations)
+     * @param dest_offset Offset in destination buffer (for WRITE operations)
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
-        uint64_t src_offset = 0);
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code,
+        size_t source_offset = 0,
+        size_t dest_offset = 0);
 
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t src_offset);
+        const std::vector<Slice>& slices,
+        uint64_t src_offset);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
