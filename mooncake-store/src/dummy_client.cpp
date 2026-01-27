@@ -467,8 +467,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         size != shm->size) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
-            << buffer << ", need addr: " << shm->base_addr
-            << ", buffer size: " << size << ", need size: " << shm->size;
+                   << buffer << ", need addr: " << shm->base_addr
+                   << ", buffer size: " << size << ", need size: " << shm->size;
         return -1;
     }
 
