@@ -290,6 +290,12 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
+    std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes);
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);

@@ -431,160 +431,103 @@ class MooncakeStorePyWrapper {
                                         char *output_data, int actual_split_dim,
                                         int64_t r_start, int64_t r_end,
                                         int64_t r_size, size_t element_size) {
-        // Iterate through writer chunks and copy overlapping parts
-        int writer_rank = 0;
+        constexpr size_t kChunkMetaSize = sizeof(ChunkMetadata);
+        constexpr size_t kMaxPutTp = 32;
 
-        while (true) {
-            std::string chunk_key = get_tp_key_name(key, writer_rank);
-            std::string chunk_meta_key =
-                get_chunk_meta_key_name(key, writer_rank);
+        // Phase 1: Batch get all chunk metadata
+        std::vector<std::string> chunk_meta_keys;
+        chunk_meta_keys.reserve(kMaxPutTp);
+        for (int r = 0; r < static_cast<int>(kMaxPutTp); r++) {
+            chunk_meta_keys.push_back(get_chunk_meta_key_name(key, r));
+        }
 
-            // Read chunk metadata
-            ChunkMetadata chunk_meta;
-            bool has_chunk_meta = false;
-            {
-                // GIL held
-                int64_t meta_size = store_->getSize(chunk_meta_key);
-                if (meta_size > 0 &&
-                    static_cast<size_t>(meta_size) >= sizeof(ChunkMetadata)) {
-                    constexpr size_t STACK_BUFFER_SIZE = 256;
-                    char stack_buffer[STACK_BUFFER_SIZE];
-                    char *buffer =
-                        (static_cast<size_t>(meta_size) <= STACK_BUFFER_SIZE)
-                            ? stack_buffer
-                            : new char[meta_size];
+        std::vector<std::shared_ptr<BufferHandle>> chunk_meta_buffers;
+        {
+            py::gil_scoped_release release_gil;
+            chunk_meta_buffers = store_->batch_get_buffer(chunk_meta_keys);
+        }
 
-                    int64_t bytes_read =
-                        store_->get_into(chunk_meta_key, buffer, meta_size);
-                    if (bytes_read > 0 && static_cast<size_t>(bytes_read) >=
-                                              sizeof(ChunkMetadata)) {
-                        memcpy(&chunk_meta, buffer, sizeof(ChunkMetadata));
-                        has_chunk_meta = true;
-                    }
+        // Phase 2: Build keys, dest_offsets, src_offsets, sizes for CCRP
+        std::vector<std::string> keys;
+        std::vector<size_t> dest_offsets, src_offsets, sizes;
 
-                    if (buffer != stack_buffer) {
-                        delete[] buffer;
-                    }
-                }
-            }
+        int64_t elements_before = 1;
+        for (int i = 0; i < actual_split_dim; i++) {
+            elements_before *= global_meta.shape[i];
+        }
+        int64_t elements_after = 1;
+        for (int i = actual_split_dim + 1; i < global_meta.ndim; i++) {
+            elements_after *= global_meta.shape[i];
+        }
+        int64_t slice_size_bytes = elements_after * element_size;
+        constexpr size_t chunk_metadata_size = sizeof(TensorMetadata);
 
-            if (!has_chunk_meta) {
+        for (int writer_rank = 0;
+             writer_rank < static_cast<int>(chunk_meta_buffers.size());
+             writer_rank++) {
+            if (!chunk_meta_buffers[writer_rank] ||
+                chunk_meta_buffers[writer_rank]->size() < kChunkMetaSize) {
                 break;  // No more chunks
             }
+
+            ChunkMetadata chunk_meta;
+            memcpy(&chunk_meta, chunk_meta_buffers[writer_rank]->ptr(),
+                   kChunkMetaSize);
 
             int64_t w_start = chunk_meta.start_idx;
             int64_t w_end = w_start + chunk_meta.size;
 
-            // Calculate intersection
             int64_t inter_start = std::max(w_start, r_start);
             int64_t inter_end = std::min(w_end, r_end);
-            if (inter_start >= inter_end) {
-                writer_rank++;
-                continue;  // No overlap
-            }
+            if (inter_start >= inter_end) continue;
 
-            // Calculate source and destination offsets
             int64_t src_start = inter_start - w_start;
             int64_t dst_start = inter_start - r_start;
             int64_t dst_end = inter_end - r_start;
+            int64_t copy_slices = dst_end - dst_start;
 
-            // Copy data slice by slice
-            // For row-major storage, we need to consider all dimensions
-            // Calculate elements before and after split_dim
-            int64_t elements_before = 1;
-            for (int i = 0; i < actual_split_dim; i++) {
-                elements_before *= global_meta.shape[i];
-            }
-            int64_t elements_after = 1;
-            for (int i = actual_split_dim + 1; i < global_meta.ndim; i++) {
-                elements_after *= global_meta.shape[i];
-            }
-
-            // Size of one slice along split_dim (in bytes)
-            // A slice is a combination of all dimensions except split_dim
-            int64_t slice_size_bytes = elements_after * element_size;
-
-            // Calculate stride for split_dim in the chunk and output
-            // For chunk: stride = chunk_size * elements_after * element_size
-            // For output: stride = r_size * elements_after * element_size
             int64_t chunk_stride_bytes = chunk_meta.size * slice_size_bytes;
             int64_t output_stride_bytes = r_size * slice_size_bytes;
 
-            // Copy size along split_dim (number of slices to copy)
-            int64_t copy_slices = dst_end - dst_start;
-
-            // Source offset in chunk (skip TensorMetadata)
-            // Storage format: [TensorMetadata (40 bytes)][tensor data]
-            // So we need to add 40 bytes to skip the metadata when reading
-            constexpr size_t chunk_metadata_size =
-                sizeof(TensorMetadata);  // 40 bytes
+            std::string chunk_key = get_tp_key_name(key, writer_rank);
 
             if (actual_split_dim == 0) {
-                // split_dim=0: data is contiguous, use get_buffer_range to
-                // read only the required slice directly into output buffer
                 int64_t total_copy_size = copy_slices * slice_size_bytes;
-                // src_offset_bytes: offset from the beginning of the stored
-                // object = metadata_size (40 bytes) + offset in tensor data
-                int64_t src_offset_bytes =
-                    chunk_metadata_size + src_start * slice_size_bytes;
-                int64_t dst_offset_bytes = dst_start * slice_size_bytes;
-
-                // Use get_buffer_range to read only the required data slice
-                // directly into the output buffer, avoiding intermediate
-                // allocation and copy
-                int64_t bytes_read;
-                {
-                    // GIL held
-                    bytes_read = store_->get_buffer_range(
-                        chunk_key, output_data, dst_offset_bytes,
-                        src_offset_bytes, total_copy_size);
-                }
-
-                if (bytes_read < 0) {
-                    // Error reading, skip this chunk
-                    writer_rank++;
-                    continue;
-                }
+                keys.push_back(chunk_key);
+                dest_offsets.push_back(dst_start * slice_size_bytes);
+                src_offsets.push_back(chunk_metadata_size +
+                                     src_start * slice_size_bytes);
+                sizes.push_back(total_copy_size);
             } else {
-                // split_dim > 0: need to copy slice by slice
-                // For each combination of dimensions before split_dim,
-                // copy the overlapping slices along split_dim
-                // Use get_buffer_range to read only the specific slice needed
-                // for each iteration, avoiding repeated reads of the entire
-                // chunk
                 for (int64_t slice_idx = 0; slice_idx < elements_before;
                      slice_idx++) {
-                    // Calculate offset for this slice in both chunk and output
-                    // src_slice_offset_bytes: offset from the beginning of the
-                    // stored object = metadata_size (40 bytes) + offset in
-                    // tensor data
-                    int64_t src_slice_offset_bytes =
+                    int64_t src_slice_offset =
                         chunk_metadata_size + slice_idx * chunk_stride_bytes +
                         src_start * slice_size_bytes;
-                    int64_t dst_slice_offset_bytes =
+                    int64_t dst_slice_offset =
                         slice_idx * output_stride_bytes +
                         dst_start * slice_size_bytes;
                     int64_t copy_size = copy_slices * slice_size_bytes;
 
-                    // Use get_buffer_range to read only the specific slice
-                    // range directly into the output buffer, avoiding the need
-                    // to read the entire chunk repeatedly
-                    int64_t bytes_read;
-                    {
-                        // GIL held
-                        bytes_read = store_->get_buffer_range(
-                            chunk_key, output_data + dst_slice_offset_bytes, 0,
-                            src_slice_offset_bytes, copy_size);
-                    }
-
-                    if (bytes_read < 0) {
-                        // Error reading, skip this slice
-                        continue;
-                    }
+                    keys.push_back(chunk_key);
+                    dest_offsets.push_back(dst_slice_offset);
+                    src_offsets.push_back(src_slice_offset);
+                    sizes.push_back(copy_size);
                 }
             }
-            writer_rank++;
         }
+
+        if (keys.empty()) return;
+
+        // Phase 3: Single batch_get_buffer_ranges call (CCRP, internal use only)
+        std::vector<int64_t> batch_res;
+        {
+            py::gil_scoped_release release_gil;
+            RealClient *rc = static_cast<RealClient *>(store_.get());
+            batch_res = rc->batch_get_buffer_ranges(
+                keys, output_data, dest_offsets, src_offsets, sizes);
+        }
+        (void)batch_res;  // Results checked per-range; partial success allowed
     }
 
     // Helper function to store chunk and global metadata for TP tensors

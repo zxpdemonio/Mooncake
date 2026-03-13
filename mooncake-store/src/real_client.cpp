@@ -2535,6 +2535,41 @@ int64_t RealClient::get_buffer_range(const std::string &key, void *dest_buffer,
                                                source_offset, size));
 }
 
+std::vector<int64_t> RealClient::batch_get_buffer_ranges(
+    const std::vector<std::string> &keys, void *dest_buffer,
+    const std::vector<size_t> &dest_offsets,
+    const std::vector<size_t> &src_offsets,
+    const std::vector<size_t> &sizes) {
+    const size_t n = keys.size();
+    std::vector<int64_t> results(n, -static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return results;
+    }
+    if (keys.size() != dest_offsets.size() ||
+        keys.size() != src_offsets.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "batch_get_buffer_ranges: size mismatch";
+        return results;
+    }
+    if (n == 0) return results;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (sizes[i] == 0) {
+            results[i] = 0;
+            continue;
+        }
+        auto ret = get_buffer_range_internal(
+            keys[i], dest_buffer, dest_offsets[i], src_offsets[i], sizes[i]);
+        if (ret) {
+            results[i] = static_cast<int64_t>(sizes[i]);
+        } else {
+            results[i] = -static_cast<int64_t>(ret.error());
+        }
+    }
+    return results;
+}
+
 std::string RealClient::get_hostname() const { return local_hostname; }
 
 std::vector<int> RealClient::batch_put_from(
