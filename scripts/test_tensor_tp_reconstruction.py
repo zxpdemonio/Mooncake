@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """
-Comprehensive TP reconstruction performance test.
+TP reconstruction performance test.
 
-Covers:
-- split_dim: 0, 1, 2, 3
-- put_tp / get_tp: 2, 4, 8
-- Relations: put_tp > get_tp, put_tp == get_tp, put_tp < get_tp
-- Methods: Direct get (when put_tp==get_tp), All gather, CCRP
+Requirements:
+1. Real multi-process for put and get
+2. CCRP (get_tensor_with_tp_into) - direct is covered as CCRP fast path when put_tp==get_tp
+3. All Gather as control group - each rank gets full tensor, slices locally
+4. Each process puts/gets only its own chunk - single key, no batch API
+
+Put: put_tp processes, each does put_tensor_chunk_with_tp(key, my_chunk, ...)
+Get (CCRP): get_tp processes, each does get_tensor_with_tp_into(key, buffer, size, ...)
+Get (All Gather control): get_tp processes, each fetches all chunks via get_tensor, concats, slices locally
 """
 
 import argparse
 import ctypes
-import sys
+import multiprocessing
 import time
+import uuid
+
+import numpy as np
+import torch
 
 TENSOR_METADATA_SIZE = 4 + 4 + 8 * 4  # 40 bytes
 
 
+def get_output_buffer_size(tensor, get_tp):
+    """Size needed for get_tensor_with_tp_into buffer: meta + data."""
+    output_numel = (tensor.numel() * tensor.element_size()) // get_tp
+    return TENSOR_METADATA_SIZE + output_numel
+
+
 def create_store():
+    from mooncake.store import MooncakeDistributedStore
+    from mooncake.mooncake_config import MooncakeConfig
     store = MooncakeDistributedStore()
     config = MooncakeConfig.load_from_env()
     rc = store.setup(
@@ -34,84 +50,117 @@ def create_store():
     return store
 
 
-def get_tp_key(base_key, rank):
-    return f"{base_key}_tp_{rank}"
+def _init_worker_store():
+    """Initialize worker's mooncake client (called once when worker process starts)."""
+    global _worker_store
+    _worker_store = create_store()
 
 
 def make_tensor_for_split_dim(split_dim, size_mb, max_tp=8):
     """Create 4D tensor where split_dim dimension is divisible by max_tp."""
     size_bytes = int(size_mb * 1024 * 1024)
     target_numel = size_bytes // 4
-    # 4D [d0,d1,d2,d3], split_dim-th dim divisible by max_tp
     other_dims = [32, 32, 32]
-    prod_other = np.prod(other_dims)
+    prod_other = 32 * 32 * 32
     split_dim_size = target_numel // prod_other
     split_dim_size = max(max_tp, (split_dim_size // max_tp) * max_tp)
     shape = other_dims[:split_dim] + [split_dim_size] + other_dims[split_dim:]
     return torch.randn(*shape, dtype=torch.float32).contiguous()
 
 
-def reconstruct_direct(store, base_keys, tp_size, split_dim, get_rank):
-    """Direct get when put_tp == get_tp: each rank gets its chunk."""
-    keys = [get_tp_key(k, get_rank) for k in base_keys]
-    bufs = store.batch_get_buffer(keys)
-    if not bufs or any(b is None for b in bufs):
-        return None
-    return [bytes(b) for b in bufs]
-
-
-def reconstruct_all_gather(store, base_keys, put_tp, get_tp, split_dim, get_rank):
-    """All gather: fetch all put chunks, concat, extract slice."""
-    chunk_keys = []
-    for k in base_keys:
-        for r in range(put_tp):
-            chunk_keys.append(get_tp_key(k, r))
-    buffers = store.batch_get_buffer(chunk_keys)
-    if not buffers or any(b is None for b in buffers):
-        return None
-    import struct
-    results = []
-    for key_idx in range(len(base_keys)):
-        chunks = [
-            bytes(buffers[key_idx * put_tp + r])[TENSOR_METADATA_SIZE:]
-            for r in range(put_tp)
-        ]
-        full_data = b"".join(chunks)
-        full_numel = len(full_data) // 4
-        step = full_numel // get_tp
-        start, end = get_rank * step, (get_rank + 1) * step
-        slice_data = full_data[start * 4 : end * 4]
-        meta = bytearray(bytes(buffers[key_idx * put_tp])[:TENSOR_METADATA_SIZE])
-        shape = list(struct.unpack_from("<" + "q" * 4, meta, 8))
-        shape[split_dim] = shape[split_dim] // get_tp
-        struct.pack_into("<" + "q" * 4, meta, 8, *shape)
-        results.append(bytes(meta) + slice_data)
-    return results
-
-
-def reconstruct_ccrp(store, base_keys, put_tp, get_tp, split_dim, get_rank):
-    """CCRP: batch_get_tensor_with_tp - uses store metadata (put_tp/size/offset)."""
-    tensors = store.batch_get_tensor_with_tp(
-        base_keys, tp_rank=get_rank, tp_size=get_tp, split_dim=split_dim
+def _put_worker(args):
+    """Put rank uses pre-created client, puts its single chunk (put_tensor_chunk_with_tp)."""
+    put_rank, key, chunk, put_tp, split_dim = args
+    rc = _worker_store.put_tensor_chunk_with_tp(
+        key, chunk,
+        put_tp_rank=put_rank, put_tp_size=put_tp, split_dim=split_dim
     )
-    if not tensors or any(t is None for t in tensors):
-        return None
-    return tensors
+    return rc == 0
 
 
-def run_one_case(
-    store, base_keys, tensors, put_tp, get_tp, split_dim, iters, results_table
-):
-    """Run one (put_tp, get_tp, split_dim) case and record results."""
-    store.remove_all()
-    rc = store.batch_put_tensor_with_tp(
-        base_keys, tensors, tp_size=put_tp, split_dim=split_dim
+def _get_worker(args):
+    """Get rank uses pre-created client, gets its slice (get_tensor_with_tp_into, CCRP)."""
+    get_rank, key, tensor, get_tp, split_dim = args
+    store = _worker_store
+    sz = get_output_buffer_size(tensor, get_tp)
+    buf = (ctypes.c_ubyte * sz)()
+    ptr = ctypes.addressof(buf)
+    if store.register_buffer(ptr, sz) != 0:
+        return False
+    try:
+        t = store.get_tensor_with_tp_into(
+            key, ptr, sz,
+            tp_rank=get_rank, tp_size=get_tp, split_dim=split_dim
+        )
+        return t is not None
+    finally:
+        store.unregister_buffer(ptr)
+
+
+def _get_chunk_key(base_key, rank):
+    return f"{base_key}_tp_{rank}"
+
+
+def _get_all_gather_worker(args):
+    """Get rank uses pre-created client, gets full tensor (All Gather control)."""
+    get_rank, key, put_tp, get_tp, split_dim = args
+    store = _worker_store
+    # Fetch all put_tp chunks one by one (All Gather: each rank gets all data)
+    chunks = []
+    for r in range(put_tp):
+        c = store.get_tensor(_get_chunk_key(key, r))
+        if c is None:
+            return False
+        chunks.append(c)
+    # Concat along split_dim to get full tensor, then slice locally
+    full = torch.cat(chunks, dim=split_dim)
+    _ = full.chunk(get_tp, split_dim)[get_rank]
+    return True
+
+
+def run_one_case(pool, key, tensor, put_tp, get_tp, split_dim, iters, results_table):
+    """Run one case: multi-process put + multi-process get (CCRP + All Gather control).
+    Uses pre-created pool - workers have their own mooncake clients, no fork/spawn during test."""
+    # Clear store before put (use temp client, close immediately)
+    tmp_store = create_store()
+    tmp_store.remove_all()
+    tmp_store.close()
+
+    # Chunk for put
+    chunks = list(tensor.chunk(put_tp, split_dim))
+
+    # Multi-process put: use pre-created pool
+    put_results = pool.map(
+        _put_worker,
+        [(r, key, chunks[r], put_tp, split_dim) for r in range(put_tp)]
     )
-    if not all(r == 0 for r in rc):
+    if not all(put_results):
         return False
 
-    full_size = sum(t.numel() * t.element_size() for t in tensors)
+    full_size = tensor.numel() * tensor.element_size()
     output_size = full_size // get_tp
+
+    # Multi-process get (CCRP): use pre-created pool
+    ccrp_times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        get_results = pool.map(
+            _get_worker,
+            [(r, key, tensor, get_tp, split_dim) for r in range(get_tp)]
+        )
+        if all(get_results):
+            ccrp_times.append(time.perf_counter() - t0)
+
+    # Multi-process get (All Gather control): use pre-created pool
+    all_gather_times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        get_results = pool.map(
+            _get_all_gather_worker,
+            [(r, key, put_tp, get_tp, split_dim) for r in range(get_tp)]
+        )
+        if all(get_results):
+            all_gather_times.append(time.perf_counter() - t0)
 
     row = {
         "put_tp": put_tp,
@@ -119,66 +168,13 @@ def run_one_case(
         "split_dim": split_dim,
         "full_mb": full_size / 1e6,
         "output_mb": output_size / 1e6,
-        "direct_ms": None,
-        "all_gather_ms": None,
-        "ccrp_ms": None,
-        "direct_mbps": None,
-        "all_gather_mbps": None,
-        "ccrp_mbps": None,
+        "all_gather_ms": np.mean(all_gather_times) * 1000 if all_gather_times else None,
+        "all_gather_mbps": (full_size / 1e6) / np.mean(all_gather_times) if all_gather_times else None,
+        "ccrp_ms": np.mean(ccrp_times) * 1000 if ccrp_times else None,
+        "ccrp_mbps": (full_size / 1e6) / np.mean(ccrp_times) if ccrp_times else None,
     }
-
-    # Direct (only when put_tp == get_tp)
-    if put_tp == get_tp:
-        times = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            for rank in range(get_tp):
-                r = reconstruct_direct(store, base_keys, get_tp, split_dim, rank)
-                if r is None:
-                    break
-            else:
-                times.append(time.perf_counter() - t0)
-        if times:
-            row["direct_ms"] = np.mean(times) * 1000
-            # Direct: each rank reads output_size, total = full_size
-            row["direct_mbps"] = (full_size / 1e6) / np.mean(times)
-
-    # All gather: ALWAYS run as baseline for comparison (both put_tp==get_tp and put_tp!=get_tp)
-    times = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        for rank in range(get_tp):
-            r = reconstruct_all_gather(
-                store, base_keys, put_tp, get_tp, split_dim, rank
-            )
-            if r is None:
-                break
-        else:
-            times.append(time.perf_counter() - t0)
-    if times:
-        row["all_gather_ms"] = np.mean(times) * 1000
-        # All gather: each rank reads full_size, total = get_tp * full_size
-        row["all_gather_mbps"] = (get_tp * full_size / 1e6) / np.mean(times)
-
-    # CCRP: run for all cases (when put_tp==get_tp, CCRP equiv to Direct; when put_tp!=get_tp, CCRP avoids read amplification)
-    times = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        for rank in range(get_tp):
-            r = reconstruct_ccrp(
-                store, base_keys, put_tp, get_tp, split_dim, rank
-            )
-            if r is None:
-                break
-        else:
-            times.append(time.perf_counter() - t0)
-    if times:
-        row["ccrp_ms"] = np.mean(times) * 1000
-        # CCRP: each rank reads output_size, total = full_size
-        row["ccrp_mbps"] = (full_size / 1e6) / np.mean(times)
-
     results_table.append(row)
-    return True
+    return bool(ccrp_times) and bool(all_gather_times)
 
 
 def print_table(results_table, fmt="text"):
@@ -186,105 +182,127 @@ def print_table(results_table, fmt="text"):
     if fmt == "csv":
         print(
             "put_tp,get_tp,split_dim,rel,full_mb,output_mb,"
-            "direct_ms,direct_mbps,all_gather_ms,all_gather_mbps,ccrp_ms,ccrp_mbps"
+            "all_gather_ms,all_gather_mbps,ccrp_ms,ccrp_mbps,speedup"
         )
         for r in results_table:
             rel = (
-                "eq"
-                if r["put_tp"] == r["get_tp"]
+                "eq" if r["put_tp"] == r["get_tp"]
                 else ("gt" if r["put_tp"] > r["get_tp"] else "lt")
             )
+            ag_ms = r["all_gather_ms"] if r["all_gather_ms"] is not None else ""
+            ag_mb = r["all_gather_mbps"] if r["all_gather_mbps"] is not None else ""
+            ccrp_ms = r["ccrp_ms"] if r["ccrp_ms"] is not None else ""
+            ccrp_mb = r["ccrp_mbps"] if r["ccrp_mbps"] is not None else ""
+            sp = ""
+            if r["all_gather_ms"] and r["ccrp_ms"] and r["all_gather_ms"] > 0:
+                sp = f"{r['all_gather_ms'] / r['ccrp_ms']:.2f}x"
             print(
                 f"{r['put_tp']},{r['get_tp']},{r['split_dim']},{rel},"
                 f"{r['full_mb']:.2f},{r['output_mb']:.2f},"
-                f"{r['direct_ms'] or ''},{r['direct_mbps'] or ''},"
-                f"{r['all_gather_ms'] or ''},{r['all_gather_mbps'] or ''},"
-                f"{r['ccrp_ms'] or ''},{r['ccrp_mbps'] or ''}"
+                f"{ag_ms},{ag_mb},{ccrp_ms},{ccrp_mb},{sp}"
             )
         return
 
-    # Text table
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 95)
     print(
         f"{'put_tp':>6} {'get_tp':>6} {'split':>5} {'rel':>3} | "
-        f"{'direct_ms':>9} {'direct_MB/s':>10} | "
         f"{'all_gather_ms':>12} {'all_gather_MB/s':>14} | "
-        f"{'ccrp_ms':>8} {'ccrp_MB/s':>10} | speedup"
+        f"{'ccrp_ms':>8} {'ccrp_MB/s':>10} | {'speedup':>8}"
     )
-    print("-" * 100)
-
+    print("-" * 95)
     for r in results_table:
         rel = (
-            "=="
-            if r["put_tp"] == r["get_tp"]
+            "==" if r["put_tp"] == r["get_tp"]
             else (">" if r["put_tp"] > r["get_tp"] else "<")
         )
-        d_ms = f"{r['direct_ms']:.1f}" if r["direct_ms"] is not None else "-"
-        d_mb = f"{r['direct_mbps']:.0f}" if r["direct_mbps"] is not None else "-"
         ag_ms = f"{r['all_gather_ms']:.1f}" if r["all_gather_ms"] is not None else "-"
         ag_mb = f"{r['all_gather_mbps']:.0f}" if r["all_gather_mbps"] is not None else "-"
-        c_ms = f"{r['ccrp_ms']:.1f}" if r["ccrp_ms"] is not None else "-"
-        c_mb = f"{r['ccrp_mbps']:.0f}" if r["ccrp_mbps"] is not None else "-"
-
-        speedup = ""
-        if r["ccrp_ms"] and r["all_gather_ms"] and r["ccrp_ms"] > 0:
-            sp = r["all_gather_ms"] / r["ccrp_ms"]
-            speedup = f"{sp:.2f}x" if sp > 1 else f"1/{1/sp:.2f}x"
-
+        ccrp_ms = f"{r['ccrp_ms']:.1f}" if r["ccrp_ms"] is not None else "-"
+        ccrp_mb = f"{r['ccrp_mbps']:.0f}" if r["ccrp_mbps"] is not None else "-"
+        sp = "-"
+        if r["all_gather_ms"] and r["ccrp_ms"] and r["all_gather_ms"] > 0:
+            sp = f"{r['all_gather_ms'] / r['ccrp_ms']:.2f}x"
         print(
             f"{r['put_tp']:>6} {r['get_tp']:>6} {r['split_dim']:>5} {rel:>3} | "
-            f"{d_ms:>9} {d_mb:>10} | "
             f"{ag_ms:>12} {ag_mb:>14} | "
-            f"{c_ms:>8} {c_mb:>10} | {speedup}"
+            f"{ccrp_ms:>8} {ccrp_mb:>10} | {sp:>8}"
         )
 
 
-def _run_demo(args):
-    """Output synthetic demo data without connecting to store."""
+def main():
+    parser = argparse.ArgumentParser(
+        description="TP reconstruction test: multi-process put/get, CCRP + All Gather control"
+    )
+    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--size_mb", type=float, default=512)
+    parser.add_argument("--tp_sizes", type=str, default="4,8")
+    parser.add_argument("--split_dims", type=str, default="0,1,2")
+    parser.add_argument("--csv", action="store_true", help="Output CSV")
+    parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument("--skip_eq", action="store_true", help="Skip put_tp==get_tp")
+    parser.add_argument("--skip_gt", action="store_true", help="Skip put_tp>get_tp")
+    parser.add_argument("--skip_lt", action="store_true", help="Skip put_tp<get_tp")
+    parser.add_argument(
+        "--cases",
+        type=str,
+        default=None,
+        help="Override: run only these cases, format 'put_tp,get_tp,split_dim' space-separated, e.g. '8,8,2 8,8,0 8,4,2'",
+    )
+    args = parser.parse_args()
+
     tp_sizes = [int(x) for x in args.tp_sizes.split(",")]
     split_dims = [int(x) for x in args.split_dims.split(",")]
-    full_mb = args.num_tensors * args.size_mb
-    results_table = []
-    for put_tp in tp_sizes:
-        for get_tp in tp_sizes:
-            for split_dim in split_dims:
-                if split_dim >= 4:
+
+    cases = []
+    if args.cases:
+        for s in args.cases.split():
+            parts = [int(x) for x in s.split(",")]
+            if len(parts) == 3:
+                cases.append(tuple(parts))
+    else:
+        for put_tp in tp_sizes:
+            for get_tp in tp_sizes:
+                if put_tp == get_tp and args.skip_eq:
                     continue
-                output_mb = full_mb / get_tp
-                row = {
-                    "put_tp": put_tp,
-                    "get_tp": get_tp,
-                    "split_dim": split_dim,
-                    "full_mb": full_mb,
-                    "output_mb": output_mb,
-                    "direct_ms": None,
-                    "all_gather_ms": None,
-                    "ccrp_ms": None,
-                    "direct_mbps": None,
-                    "all_gather_mbps": None,
-                    "ccrp_mbps": None,
-                }
-                if put_tp == get_tp:
-                    row["direct_ms"] = 15 + split_dim * 2 + put_tp
-                    row["direct_mbps"] = (full_mb * 1e6 / 1e6) / (
-                        row["direct_ms"] / 1000
-                    )
-                # All gather: always present as baseline for comparison
-                if put_tp == get_tp:
-                    ag_ms = 50 + split_dim * 3 + put_tp * 2  # all-gather reads full per rank
-                else:
-                    ag_ms = 45 + split_dim * 5 + abs(put_tp - get_tp) * 3
-                row["all_gather_ms"] = ag_ms
-                row["all_gather_mbps"] = (get_tp * full_mb) / (ag_ms / 1000)
-                # CCRP: always present
-                ccrp_ms = 22 + split_dim * 3 + (abs(put_tp - get_tp) if put_tp != get_tp else 0) * 2
-                row["ccrp_ms"] = ccrp_ms
-                row["ccrp_mbps"] = full_mb / (ccrp_ms / 1000)
-                results_table.append(row)
-    print(f"\n=== TP Reconstruction Comprehensive Test (DEMO - synthetic data) ===")
-    print(f"Tensors: {args.num_tensors} x {args.size_mb} MB")
+                if put_tp > get_tp and args.skip_gt:
+                    continue
+                if put_tp < get_tp and args.skip_lt:
+                    continue
+                for split_dim in split_dims:
+                    if split_dim >= 4:
+                        continue
+                    cases.append((put_tp, get_tp, split_dim))
+
+    print(f"\n=== TP Reconstruction Test (multi-process, CCRP + All Gather control) ===")
+    print(f"Put: put_tp processes, each put_tensor_chunk_with_tp(key, chunk)")
+    print(f"Get (CCRP): get_tp processes, each get_tensor_with_tp_into(key, buffer)")
+    print(f"Get (All Gather control): get_tp processes, each fetches all chunks, concats, slices")
+    print(f"Single key, {args.size_mb} MB, iters={args.iters}")
     print(f"TP sizes: {tp_sizes}, split_dims: {split_dims}")
-    print(f"Total cases: {len(results_table)}\n")
+    print(f"Total cases: {len(cases)}")
+
+    results_table = []
+    max_tp = max(max(put_tp, get_tp) for put_tp, get_tp, _ in cases) if cases else max(tp_sizes)
+
+    # Pre-create pool: workers start with their own mooncake client, avoid fork/spawn during test
+    ctx = multiprocessing.get_context("spawn")
+    pool = ctx.Pool(max_tp, initializer=_init_worker_store)
+
+    try:
+        for i, (put_tp, get_tp, split_dim) in enumerate(cases):
+            tensor = make_tensor_for_split_dim(split_dim, args.size_mb, max_tp)
+            key = f"tp_{put_tp}_{get_tp}_{split_dim}_{i}_{uuid.uuid4()}"
+            ok = run_one_case(
+                pool, key, tensor, put_tp, get_tp, split_dim, args.iters, results_table
+            )
+            if not ok:
+                print(f"  [FAIL] put_tp={put_tp} get_tp={get_tp} split_dim={split_dim}")
+            elif (i + 1) % 10 == 0:
+                print(f"  Progress: {i+1}/{len(cases)}")
+    finally:
+        pool.close()
+        pool.join()
+
     if args.json:
         import json
         out = []
@@ -294,99 +312,6 @@ def _run_demo(args):
         print(json.dumps(out, indent=2))
     else:
         print_table(results_table, fmt="csv" if args.csv else "text")
-    print("\nDone.")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Comprehensive TP reconstruction test"
-    )
-    parser.add_argument("--iters", type=int, default=3)
-    parser.add_argument("--size_mb", type=float, default=4)
-    parser.add_argument("--num_tensors", type=int, default=2)
-    parser.add_argument("--tp_sizes", type=str, default="2,4,8")
-    parser.add_argument("--split_dims", type=str, default="0,1,2,3")
-    parser.add_argument("--csv", action="store_true", help="Output CSV")
-    parser.add_argument("--json", action="store_true", help="Output JSON")
-    parser.add_argument("--skip_eq", action="store_true", help="Skip put_tp==get_tp")
-    parser.add_argument("--skip_gt", action="store_true", help="Skip put_tp>get_tp")
-    parser.add_argument("--skip_lt", action="store_true", help="Skip put_tp<get_tp")
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Output synthetic demo data (no store connection)",
-    )
-    args = parser.parse_args()
-
-    if args.demo:
-        _run_demo(args)
-        return
-
-    import numpy as np
-    import torch
-    from mooncake.store import MooncakeDistributedStore
-    from mooncake.mooncake_config import MooncakeConfig
-    globals().update(np=np, torch=torch, MooncakeDistributedStore=MooncakeDistributedStore, MooncakeConfig=MooncakeConfig)
-    tp_sizes = [int(x) for x in args.tp_sizes.split(",")]
-    split_dims = [int(x) for x in args.split_dims.split(",")]
-
-    store = create_store()
-
-    # Build test matrix
-    cases = []
-    for put_tp in tp_sizes:
-        for get_tp in tp_sizes:
-            if put_tp == get_tp and args.skip_eq:
-                continue
-            if put_tp > get_tp and args.skip_gt:
-                continue
-            if put_tp < get_tp and args.skip_lt:
-                continue
-            for split_dim in split_dims:
-                if split_dim >= 4:
-                    continue
-                cases.append((put_tp, get_tp, split_dim))
-
-    print(f"\n=== TP Reconstruction Comprehensive Test ===")
-    print(f"Tensors: {args.num_tensors} x {args.size_mb} MB, iters={args.iters}")
-    print(f"TP sizes: {tp_sizes}, split_dims: {split_dims}")
-    print(f"Total cases: {len(cases)}")
-
-    results_table = []
-    max_tp = max(tp_sizes)
-
-    for i, (put_tp, get_tp, split_dim) in enumerate(cases):
-        tensors = [
-            make_tensor_for_split_dim(split_dim, args.size_mb, max_tp)
-            for _ in range(args.num_tensors)
-        ]
-        base_keys = [
-            f"tp_{put_tp}_{get_tp}_{split_dim}_{i}_{int(time.time())}"
-            for i in range(args.num_tensors)
-        ]
-        ok = run_one_case(
-            store, base_keys, tensors, put_tp, get_tp, split_dim, args.iters, results_table
-        )
-        if not ok:
-            print(f"  [FAIL] put_tp={put_tp} get_tp={get_tp} split_dim={split_dim}")
-        elif (i + 1) % 10 == 0:
-            print(f"  Progress: {i+1}/{len(cases)}")
-
-    if args.json:
-        import json
-        out = []
-        for r in results_table:
-            o = {}
-            for k, v in r.items():
-                if v is not None and isinstance(v, float):
-                    o[k] = round(v, 2)
-                else:
-                    o[k] = v
-            out.append(o)
-        print(json.dumps(out, indent=2))
-    else:
-        print_table(results_table, fmt="csv" if args.csv else "text")
-    store.close()
     print("\nDone.")
 
 
