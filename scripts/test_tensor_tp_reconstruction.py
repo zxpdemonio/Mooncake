@@ -79,9 +79,11 @@ def _put_worker(args):
 
 
 def _get_worker(args):
-    """Get rank uses pre-created client, gets its slice (get_tensor_with_tp_into, CCRP)."""
+    """Get rank uses pre-created client, gets its slice (get_tensor_with_tp_into, CCRP).
+    Verifies data correctness against expected slice."""
     get_rank, key, tensor, get_tp, split_dim = args
     store = _worker_store
+    expected = tensor.chunk(get_tp, split_dim)[get_rank]
     sz = get_output_buffer_size(tensor, get_tp)
     buf = (ctypes.c_ubyte * sz)()
     ptr = ctypes.addressof(buf)
@@ -92,7 +94,12 @@ def _get_worker(args):
             key, ptr, sz,
             tp_rank=get_rank, tp_size=get_tp, split_dim=split_dim
         )
-        return t is not None
+        if t is None:
+            return False
+        # Verify data correctness
+        t_cpu = t.cpu().float() if t.is_cuda else t.float()
+        exp_cpu = expected.cpu().float() if expected.is_cuda else expected.float()
+        return bool(torch.allclose(t_cpu, exp_cpu, rtol=1e-4, atol=1e-5))
     finally:
         store.unregister_buffer(ptr)
 
@@ -102,8 +109,9 @@ def _get_chunk_key(base_key, rank):
 
 
 def _get_all_gather_worker(args):
-    """Get rank uses pre-created client, gets full tensor (All Gather control)."""
-    get_rank, key, put_tp, get_tp, split_dim = args
+    """Get rank uses pre-created client, gets full tensor (All Gather control).
+    Verifies data correctness: concat chunks should match original, slice is correct."""
+    get_rank, key, put_tp, get_tp, split_dim, expected_full = args
     store = _worker_store
     # Fetch all put_tp chunks one by one (All Gather: each rank gets all data)
     chunks = []
@@ -112,8 +120,14 @@ def _get_all_gather_worker(args):
         if c is None:
             return False
         chunks.append(c)
-    # Concat along split_dim to get full tensor, then slice locally
+    # Concat along split_dim to get full tensor
     full = torch.cat(chunks, dim=split_dim)
+    # Verify full tensor matches original
+    full_cpu = full.cpu().float() if full.is_cuda else full.float()
+    exp_cpu = expected_full.cpu().float() if expected_full.is_cuda else expected_full.float()
+    if not torch.allclose(full_cpu, exp_cpu, rtol=1e-4, atol=1e-5):
+        return False
+    # Slice locally (rank's share)
     _ = full.chunk(get_tp, split_dim)[get_rank]
     return True
 
@@ -157,7 +171,7 @@ def run_one_case(pool, key, tensor, put_tp, get_tp, split_dim, iters, results_ta
         t0 = time.perf_counter()
         get_results = pool.map(
             _get_all_gather_worker,
-            [(r, key, put_tp, get_tp, split_dim) for r in range(get_tp)]
+            [(r, key, put_tp, get_tp, split_dim, tensor) for r in range(get_tp)]
         )
         if all(get_results):
             all_gather_times.append(time.perf_counter() - t0)
