@@ -109,6 +109,7 @@ python-api-reference/ep-backend
 
 design/architecture
 design/mooncake-store
+design/tp-tensor-storage-and-ccrp
 design/p2p-store
 design/transfer-engine/index
 design/tent/overview
