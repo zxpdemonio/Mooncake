@@ -2528,13 +2528,6 @@ tl::expected<int64_t, ErrorCode> RealClient::get_buffer_range_internal(
     return static_cast<int64_t>(size);
 }
 
-int64_t RealClient::get_buffer_range(const std::string &key, void *dest_buffer,
-                                     size_t dest_offset, size_t source_offset,
-                                     size_t size) {
-    return to_py_ret(get_buffer_range_internal(key, dest_buffer, dest_offset,
-                                               source_offset, size));
-}
-
 std::vector<int64_t> RealClient::batch_get_buffer_ranges(
     const std::vector<std::string> &keys, void *dest_buffer,
     const std::vector<size_t> &dest_offsets,

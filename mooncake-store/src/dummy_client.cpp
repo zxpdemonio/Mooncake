@@ -689,23 +689,6 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
 }
 
-int64_t DummyClient::get_buffer_range(const std::string& key, void* dest_buffer,
-                                      size_t dest_offset, size_t source_offset,
-                                      size_t size) {
-    (void)key;
-    (void)dest_buffer;
-    (void)dest_offset;
-    (void)source_offset;
-    (void)size;
-    return -1;  // TODO: not supported for dummy client
-}
-
-std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
-    const std::string& key) {
-    (void)key;
-    return {0, 0};  // TODO: implement for dummy client
-}
-
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     const std::vector<std::string>& keys) {
     std::vector<std::shared_ptr<BufferHandle>> results(keys.size(), nullptr);
