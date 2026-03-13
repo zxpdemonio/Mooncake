@@ -2538,10 +2538,10 @@ int64_t RealClient::get_buffer_range(const std::string &key, void *dest_buffer,
 std::vector<int64_t> RealClient::batch_get_buffer_ranges(
     const std::vector<std::string> &keys, void *dest_buffer,
     const std::vector<size_t> &dest_offsets,
-    const std::vector<size_t> &src_offsets,
-    const std::vector<size_t> &sizes) {
+    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes) {
     const size_t n = keys.size();
-    std::vector<int64_t> results(n, -static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
+    std::vector<int64_t> results(
+        n, -static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
 
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";

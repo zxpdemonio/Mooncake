@@ -496,17 +496,16 @@ class MooncakeStorePyWrapper {
                 keys.push_back(chunk_key);
                 dest_offsets.push_back(dst_start * slice_size_bytes);
                 src_offsets.push_back(chunk_metadata_size +
-                                     src_start * slice_size_bytes);
+                                      src_start * slice_size_bytes);
                 sizes.push_back(total_copy_size);
             } else {
                 for (int64_t slice_idx = 0; slice_idx < elements_before;
                      slice_idx++) {
-                    int64_t src_slice_offset =
-                        chunk_metadata_size + slice_idx * chunk_stride_bytes +
-                        src_start * slice_size_bytes;
-                    int64_t dst_slice_offset =
-                        slice_idx * output_stride_bytes +
-                        dst_start * slice_size_bytes;
+                    int64_t src_slice_offset = chunk_metadata_size +
+                                               slice_idx * chunk_stride_bytes +
+                                               src_start * slice_size_bytes;
+                    int64_t dst_slice_offset = slice_idx * output_stride_bytes +
+                                               dst_start * slice_size_bytes;
                     int64_t copy_size = copy_slices * slice_size_bytes;
 
                     keys.push_back(chunk_key);
@@ -519,7 +518,8 @@ class MooncakeStorePyWrapper {
 
         if (keys.empty()) return;
 
-        // Phase 3: Single batch_get_buffer_ranges call (CCRP, internal use only)
+        // Phase 3: Single batch_get_buffer_ranges call (CCRP, internal use
+        // only)
         std::vector<int64_t> batch_res;
         {
             py::gil_scoped_release release_gil;
