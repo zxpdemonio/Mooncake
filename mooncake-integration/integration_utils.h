@@ -147,7 +147,8 @@ struct GlobalMetadata {
     int32_t dtype;
     int32_t ndim;
     int32_t split_dim;
-    int64_t shape[4];  // Full tensor shape
+    int32_t put_tp_size;  // Number of writer chunks
+    int64_t shape[4];     // Full tensor shape
 };
 #pragma pack(pop)
 

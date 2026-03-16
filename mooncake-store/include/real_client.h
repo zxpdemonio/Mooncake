@@ -638,6 +638,14 @@ class RealClient : public PyClient {
         const std::string &key, void *dest_buffer, size_t dest_offset,
         size_t source_offset, size_t size);
 
+    tl::expected<QueryResult, ErrorCode> query_with_retry(
+        const std::string &key);
+
+    tl::expected<int64_t, ErrorCode> get_range_with_query_result(
+        const QueryResult &query_result, const std::string &key,
+        void *dest_buffer, size_t dest_offset, size_t source_offset,
+        size_t size);
+
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
