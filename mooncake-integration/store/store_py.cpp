@@ -19,7 +19,7 @@ namespace {
 struct PyTensorInfo {
     uintptr_t data_ptr;
     size_t tensor_size;
-    TensorMetadata metadata;
+    TensorMetadata metadata{};
 
     // Check validity
     bool valid() const {
@@ -228,6 +228,43 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         }
         return pybind11::none();
     }
+}
+
+bool validate_serialized_tensor_buffer(uintptr_t buffer_ptr, size_t size,
+                                       const std::string &buffer_name) {
+    if (buffer_ptr == 0) {
+        LOG(ERROR) << buffer_name << " pointer cannot be null";
+        return false;
+    }
+    if (size <= sizeof(TensorMetadata)) {
+        LOG(ERROR) << buffer_name << " size too small for tensor metadata";
+        return false;
+    }
+    return true;
+}
+
+py::object decode_serialized_tensor_buffer(uintptr_t buffer_ptr, size_t size,
+                                           const std::string &context) {
+    if (!validate_serialized_tensor_buffer(buffer_ptr, size, context)) {
+        return py::none();
+    }
+
+    py::object tensor = buffer_to_tensor(
+        nullptr, reinterpret_cast<char *>(buffer_ptr),
+        static_cast<int64_t>(size));
+    if (tensor.is_none()) {
+        LOG(ERROR) << "Failed to decode tensor buffer for " << context;
+    }
+    return tensor;
+}
+
+std::vector<void *> CastAddrs2Ptrs(const std::vector<uintptr_t> &buffer_ptrs) {
+    std::vector<void *> buffers;
+    buffers.reserve(buffer_ptrs.size());
+    for (uintptr_t ptr : buffer_ptrs) {
+        buffers.push_back(reinterpret_cast<void *>(ptr));
+    }
+    return buffers;
 }
 
 std::vector<std::vector<void *>> CastAddrs2Ptrs(
@@ -1494,8 +1531,13 @@ class MooncakeStorePyWrapper {
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
         std::vector<size_t> processed_indices;
+<<<<<<< HEAD
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+=======
+        std::vector<int> final_results(
+            base_keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
 
         // Track per-tensor info for metadata writing
         std::vector<PyTensorInfo> tensor_infos(base_keys.size());
@@ -1551,7 +1593,11 @@ class MooncakeStorePyWrapper {
             // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_idx = processed_indices[i];
+<<<<<<< HEAD
                 bool all_ok = true;
+=======
+                final_results[original_idx] = 0;
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
                 for (int j = 0; j < tp_size; ++j) {
                     int res = chunk_results[i * tp_size + j];
                     if (res != 0) {
@@ -1878,24 +1924,14 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         for (size_t i = 0; i < sizes.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            if (sizes[i] <= sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
+            if (!validate_serialized_tensor_buffer(
+                    buffer_ptrs[i], sizes[i],
+                    "Buffer at index " + std::to_string(i))) {
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
         }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
-        }
+        std::vector<void *> buffers = CastAddrs2Ptrs(buffer_ptrs);
         py::gil_scoped_release release_gil;
         return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
     }
@@ -1923,6 +1959,7 @@ class MooncakeStorePyWrapper {
         if (tp_size <= 1) {
             return put_tensor_from(key, buffer_ptr, size);
         }
+<<<<<<< HEAD
 
         pybind11::object tensor =
             buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
@@ -1930,6 +1967,11 @@ class MooncakeStorePyWrapper {
         if (tensor.is_none()) {
             LOG(ERROR) << "Failed to decode full tensor buffer for "
                           "put_tensor_with_tp_from";
+=======
+        py::object tensor = decode_serialized_tensor_buffer(
+            buffer_ptr, size, "put_tensor_with_tp_from");
+        if (tensor.is_none()) {
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
@@ -1965,12 +2007,10 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        // Read TensorMetadata from buffer
         TensorMetadata tensor_meta;
         memcpy(&tensor_meta, reinterpret_cast<const void *>(buffer_ptr),
                sizeof(TensorMetadata));
 
-        // Calculate full shape
         int64_t full_shape[4] = {0};
         try {
             calculate_full_shape(tensor_meta, split_dim, tp_size,
@@ -1980,12 +2020,10 @@ class MooncakeStorePyWrapper {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
-        // Write chunk data under tp key
         std::string tp_key = get_tp_key_name(key, tp_rank);
         int ret = put_tensor_from(tp_key, buffer_ptr, size);
         if (ret != 0) return ret;
 
-        // Write metadata
         return store_tensor_tp_metadata(key, tp_rank, tp_size, split_dim,
                                         tensor_meta, full_shape, config);
     }
@@ -2034,7 +2072,6 @@ class MooncakeStorePyWrapper {
         const size_t num_keys = base_keys.size();
         if (num_keys == 0) return std::vector<int>();
 
-        // Validate buffers
         for (size_t i = 0; i < num_keys; ++i) {
             if (buffer_ptrs[i] == 0 || sizes[i] <= sizeof(TensorMetadata)) {
                 LOG(ERROR) << "Invalid buffer at index " << i;
@@ -2043,7 +2080,6 @@ class MooncakeStorePyWrapper {
             }
         }
 
-        // Step 1: Write chunk data
         std::vector<std::string> chunk_keys;
         chunk_keys.reserve(num_keys);
         for (const auto &key : base_keys) {
@@ -2052,7 +2088,6 @@ class MooncakeStorePyWrapper {
         std::vector<int> results =
             batch_put_tensor_from(chunk_keys, buffer_ptrs, sizes);
 
-        // Step 2: Read TensorMetadata and compute full_shape
         std::vector<TensorMetadata> tensor_metas(num_keys);
         std::vector<std::array<int64_t, 4>> full_shapes(num_keys);
 
@@ -2076,7 +2111,6 @@ class MooncakeStorePyWrapper {
             }
         }
 
-        // Step 3: Batch write chunk metadata
         size_t valid_count = 0;
         for (size_t i = 0; i < num_keys; ++i) {
             if (results[i] == 0) valid_count++;
@@ -2108,7 +2142,6 @@ class MooncakeStorePyWrapper {
             store_.get(), chunk_meta_keys, chunk_meta_buffers,
             chunk_meta_sizes, chunk_meta_indices, results, config);
 
-        // Step 4: Batch write global metadata (rank 0 only)
         if (tp_rank == 0) {
             std::vector<GlobalMetadata> global_meta_storage;
             std::vector<std::string> global_meta_keys;
@@ -2141,9 +2174,7 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &base_keys,
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1,
-        int split_dim = 0,
-        const std::optional<std::vector<std::vector<int64_t>>>
-            &full_shapes_arg = std::nullopt) {
+        int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return std::vector<int>(base_keys.size(),
@@ -2164,16 +2195,23 @@ class MooncakeStorePyWrapper {
                 LOG(ERROR) << "Size mismatch: base_keys, buffer_ptrs, and "
                               "sizes must have the same length";
             }
+<<<<<<< HEAD
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
         if (full_shapes_arg.has_value() &&
             full_shapes_arg->size() != base_keys.size()) {
             LOG(ERROR) << "Size mismatch: full_shapes must match keys size";
+=======
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
+        py::list tensors_list;
+        std::vector<size_t> processed_indices;
+        std::vector<int> final_results(base_keys.size(), 0);
 
+<<<<<<< HEAD
         py::list tensors_list;
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(), 0);
@@ -2198,11 +2236,20 @@ class MooncakeStorePyWrapper {
             if (tensor.is_none()) {
                 LOG(ERROR) << "Failed to decode full tensor buffer at index "
                            << i;
+=======
+        for (size_t i = 0; i < base_keys.size(); ++i) {
+            py::object tensor = decode_serialized_tensor_buffer(
+                buffer_ptrs[i], sizes[i],
+                "batch_put_tensor_with_tp_from buffer at index " +
+                    std::to_string(i));
+            if (tensor.is_none()) {
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
                 final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                 continue;
             }
             tensors_list.append(tensor);
             processed_indices.push_back(i);
+<<<<<<< HEAD
         }
 
         if (processed_indices.empty()) {
@@ -2389,9 +2436,27 @@ class MooncakeStorePyWrapper {
                     results[original_indices[i]] = op_results[i];
                 }
             }
+=======
         }
 
-        return results;
+        if (processed_indices.empty()) {
+            return final_results;
+        }
+
+        std::vector<std::string> valid_keys;
+        valid_keys.reserve(processed_indices.size());
+        for (size_t idx : processed_indices) {
+            valid_keys.push_back(base_keys[idx]);
+        }
+
+        std::vector<int> op_results = batch_put_tensor_with_tp_impl(
+            valid_keys, tensors_list, ReplicateConfig{}, tp_rank, tp_size,
+            split_dim);
+        for (size_t i = 0; i < processed_indices.size(); ++i) {
+            final_results[processed_indices[i]] = op_results[i];
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
+        }
+        return final_results;
     }
 
     std::vector<int> batch_upsert_tensor(const std::vector<std::string> &keys,
@@ -3138,6 +3203,7 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::batch_put_tensor_with_tp_from,
              py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+<<<<<<< HEAD
              py::arg("split_dim") = 0, py::arg("full_shapes") = std::nullopt,
              "Put a batch of full tensors directly from pre-allocated "
              "buffers for Tensor Parallelism. Each buffer is internally split "
@@ -3289,6 +3355,12 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{},
             "Batch upsert raw bytes for multiple keys (insert or update)")
+=======
+             py::arg("split_dim") = 0,
+             "Put a batch of full tensors directly from pre-allocated "
+             "buffers for Tensor Parallelism. Each buffer is internally split "
+             "and stored under key_tp_<rank> for all ranks.")
+>>>>>>> 75be9e9ca (fix: correct TP zero-copy put semantics)
         .def("put_tensor_chunk_with_tp_from",
              &MooncakeStorePyWrapper::put_tensor_chunk_with_tp_from,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
