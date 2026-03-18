@@ -9,7 +9,7 @@ All put/get use zero-copy interfaces over RDMA (put_tensor_chunk_with_tp_from / 
 Test groups (each has its own independent put + get):
   1. CCRP (experimental): distributed put_tensor_chunk_with_tp_from + get_tensor_with_tp_into
   2. All Gather (control 1): node0 gathers + put_tensor_from (full tensor) + each reader get_tensor_into (full) + local slice
-  3. Gather+TP (control 2): node0 gathers + split + put_tensor_with_tp_from per chunk + get_tensor_with_tp_into (fast path)
+  3. Gather+TP (control 2): node0 gathers + single put_tensor_with_tp_from(full) + get_tensor_with_tp_into (fast path)
 
 Example (2 nodes, put_tp=16, get_tp=8 and get_tp=32):
   Node 0:
@@ -180,26 +180,21 @@ def _get_full_tensor_worker(args):
 
 
 def _put_gather_tp_worker(args):
-    """Gather+TP put: rank0 splits into get_tp chunks, puts each via put_tensor_with_tp_from (zero-copy)."""
+    """Gather+TP put: rank0 writes one full tensor buffer via put_tensor_with_tp_from."""
     key, tensor, get_tp, split_dim = args
     store = _worker_store
-    chunks = list(tensor.chunk(get_tp, split_dim))
-    max_sz = max(chunk_serialized_size(c) for c in chunks)
-    buf = (ctypes.c_ubyte * max_sz)()
+    tensor = tensor.contiguous()
+    sz = chunk_serialized_size(tensor)
+    buf = (ctypes.c_ubyte * sz)()
+    serialize_chunk_to_buffer(tensor, buf)
     ptr = ctypes.addressof(buf)
-    if store.register_buffer(ptr, max_sz) != 0:
+    if store.register_buffer(ptr, sz) != 0:
         return False
     try:
-        for rank, chunk in enumerate(chunks):
-            chunk = chunk.contiguous()
-            sz = chunk_serialized_size(chunk)
-            serialize_chunk_to_buffer(chunk, buf)
-            rc = store.put_tensor_with_tp_from(
-                key, ptr, sz, tp_rank=rank, tp_size=get_tp, split_dim=split_dim
-            )
-            if rc != 0:
-                return False
-        return True
+        rc = store.put_tensor_with_tp_from(
+            key, ptr, sz, tp_rank=0, tp_size=get_tp, split_dim=split_dim
+        )
+        return rc == 0
     finally:
         store.unregister_buffer(ptr)
 
@@ -237,46 +232,47 @@ def dist_max_time(local_time):
     return t.item()
 
 
+def _simulate_gathered_tensor(tensor, put_tp, split_dim):
+    """Simulate writer-side gather by reassembling the full tensor from put_tp chunks."""
+    if put_tp <= 1:
+        return tensor.contiguous()
+    return torch.cat(list(tensor.chunk(put_tp, split_dim)), dim=split_dim).contiguous()
+
+
 # ── Distributed test runner ──
 
 def run_distributed_case(pool, node_id, num_nodes, key, tensor,
                          put_tp, put_ranks_per_node,
                          get_tp, get_ranks_per_node,
                          split_dim, iters):
-    """Run one (put_tp, get_tp, split_dim) case across all nodes.
-    Each test group has its own independent put + get phase, all zero-copy."""
+    """Run one case across all nodes with end-to-end timing for put + get."""
     put_rank_start = node_id * put_ranks_per_node
     get_rank_start = node_id * get_ranks_per_node
 
     full_size = tensor.numel() * tensor.element_size()
     output_size = full_size // get_tp
 
-    # ── Clear store (node 0 only) ──
     if node_id == 0:
         tmp = create_store()
         tmp.remove_all()
         tmp.close()
     dist.barrier()
 
-    # ══════════════════════════════════════════════════════════════════
-    # CCRP: distributed put_tensor_chunk_with_tp_from + get_tensor_with_tp_into
-    # ══════════════════════════════════════════════════════════════════
-    ccrp_key = f"{key}_ccrp"
-    chunks = list(tensor.chunk(put_tp, split_dim))
-    put_args = [
-        (put_rank_start + r, ccrp_key, chunks[put_rank_start + r], put_tp, split_dim)
-        for r in range(put_ranks_per_node)
-    ]
-    put_results = pool.map(_put_worker, put_args)
-    if not all(put_results):
-        print(f"  [Node {node_id}] CCRP put FAILED")
-        return None
-    dist.barrier()
-
     ccrp_times = []
     for it in range(iters):
+        ccrp_key = f"{key}_ccrp_{it}"
+        chunks = list(tensor.chunk(put_tp, split_dim))
+        put_args = [
+            (put_rank_start + r, ccrp_key, chunks[put_rank_start + r], put_tp, split_dim)
+            for r in range(put_ranks_per_node)
+        ]
         dist.barrier()
         t0 = time.perf_counter()
+        put_results = pool.map(_put_worker, put_args)
+        dist.barrier()
+        if not all(put_results):
+            print(f"  [Node {node_id}] CCRP put iter {it} FAILED")
+            continue
         get_args = [
             (get_rank_start + r, ccrp_key, tensor, get_tp, split_dim)
             for r in range(get_ranks_per_node)
@@ -289,20 +285,17 @@ def run_distributed_case(pool, node_id, num_nodes, key, tensor,
         else:
             print(f"  [Node {node_id}] CCRP get iter {it} FAILED")
 
-    # ══════════════════════════════════════════════════════════════════
-    # All Gather: node0 put_tensor_from (full tensor) + get_tensor_into (full) + local slice
-    # ══════════════════════════════════════════════════════════════════
-    ag_key = f"{key}_ag"
-    if node_id == 0:
-        ag_put = pool.map(_put_full_tensor_worker, [(ag_key, tensor)])
-        if not all(ag_put):
-            print(f"  [Node 0] All Gather put FAILED")
-    dist.barrier()
-
     all_gather_times = []
     for it in range(iters):
+        ag_key = f"{key}_ag_{it}"
+        gathered_tensor = _simulate_gathered_tensor(tensor, put_tp, split_dim)
         dist.barrier()
         t0 = time.perf_counter()
+        if node_id == 0:
+            ag_put = pool.map(_put_full_tensor_worker, [(ag_key, gathered_tensor)])
+            if not all(ag_put):
+                print(f"  [Node 0] All Gather put iter {it} FAILED")
+        dist.barrier()
         get_args = [
             (get_rank_start + r, ag_key, tensor, get_tp, split_dim)
             for r in range(get_ranks_per_node)
@@ -315,23 +308,20 @@ def run_distributed_case(pool, node_id, num_nodes, key, tensor,
         else:
             print(f"  [Node {node_id}] AllGather get iter {it} FAILED")
 
-    # ══════════════════════════════════════════════════════════════════
-    # Gather+TP: node0 split + put_tensor_with_tp_from per chunk + get_tensor_with_tp_into (fast path)
-    # ══════════════════════════════════════════════════════════════════
-    gtp_key = f"{key}_gtp"
-    if node_id == 0:
-        gtp_put = pool.map(
-            _put_gather_tp_worker,
-            [(gtp_key, tensor, get_tp, split_dim)]
-        )
-        if not all(gtp_put):
-            print(f"  [Node 0] Gather+TP put FAILED")
-    dist.barrier()
-
     gather_tp_times = []
     for it in range(iters):
+        gtp_key = f"{key}_gtp_{it}"
+        gathered_tensor = _simulate_gathered_tensor(tensor, put_tp, split_dim)
         dist.barrier()
         t0 = time.perf_counter()
+        if node_id == 0:
+            gtp_put = pool.map(
+                _put_gather_tp_worker,
+                [(gtp_key, gathered_tensor, get_tp, split_dim)]
+            )
+            if not all(gtp_put):
+                print(f"  [Node 0] Gather+TP put iter {it} FAILED")
+        dist.barrier()
         get_args = [
             (get_rank_start + r, gtp_key, tensor, get_tp, split_dim)
             for r in range(get_ranks_per_node)
@@ -344,10 +334,12 @@ def run_distributed_case(pool, node_id, num_nodes, key, tensor,
         else:
             print(f"  [Node {node_id}] Gather+TP get iter {it} FAILED")
 
-    # ── Results ──
     ag_mean = np.mean(all_gather_times) if all_gather_times else None
     ccrp_mean = np.mean(ccrp_times) if ccrp_times else None
     gtp_mean = np.mean(gather_tp_times) if gather_tp_times else None
+    ccrp_total_mb = (2 * full_size) / 1e6
+    ag_total_mb = ((get_tp + 1) * full_size) / 1e6
+    gtp_total_mb = (2 * full_size) / 1e6
     return {
         "put_tp": put_tp,
         "get_tp": get_tp,
@@ -355,11 +347,11 @@ def run_distributed_case(pool, node_id, num_nodes, key, tensor,
         "full_mb": full_size / 1e6,
         "output_mb": output_size / 1e6,
         "all_gather_ms": ag_mean * 1000 if ag_mean else None,
-        "all_gather_mbps": (get_tp * full_size / 1e6) / ag_mean if ag_mean else None,
+        "all_gather_mbps": ag_total_mb / ag_mean if ag_mean else None,
         "gather_tp_ms": gtp_mean * 1000 if gtp_mean else None,
-        "gather_tp_mbps": (full_size / 1e6) / gtp_mean if gtp_mean else None,
+        "gather_tp_mbps": gtp_total_mb / gtp_mean if gtp_mean else None,
         "ccrp_ms": ccrp_mean * 1000 if ccrp_mean else None,
-        "ccrp_mbps": (full_size / 1e6) / ccrp_mean if ccrp_mean else None,
+        "ccrp_mbps": ccrp_total_mb / ccrp_mean if ccrp_mean else None,
     }
 
 
@@ -490,7 +482,7 @@ def main():
         print(f"Test groups per case:")
         print(f"  1. CCRP: distributed put_tensor_chunk_with_tp_from + get_tensor_with_tp_into")
         print(f"  2. All Gather: node0 put_tensor_from(full) + get_tensor_into(full) + local slice")
-        print(f"  3. Gather+TP: node0 split + put_tensor_with_tp_from + get_tensor_with_tp_into(fast path)")
+        print(f"  3. Gather+TP: node0 gathers full tensor + single put_tensor_with_tp_from + get_tensor_with_tp_into(fast path)")
 
     results_table = []
     try:
