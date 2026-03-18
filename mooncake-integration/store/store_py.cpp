@@ -8,6 +8,7 @@
 #include "types.h"
 
 #include <cstdlib>  // for atexit
+#include <chrono>
 
 #include "integration_utils.h"
 
@@ -396,7 +397,10 @@ class MooncakeStorePyWrapper {
         return {start_idx, size};
     }
 
-    // Helper function to batch put metadata and update results
+    // Helper function to batch put metadata and update results.
+    // Metadata buffers are small internal temporaries and are not registered
+    // with the zero-copy path, so use the regular put_batch API instead of
+    // batch_put_from.
     static void batch_put_metadata_and_update_results(
         PyClient *store, const std::vector<std::string> &meta_keys,
         const std::vector<void *> &meta_buffers,
@@ -405,15 +409,21 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config) {
         if (meta_keys.empty()) return;
 
-        std::vector<int> meta_results;
+        std::vector<std::span<const char>> meta_spans;
+        meta_spans.reserve(meta_keys.size());
+        for (size_t i = 0; i < meta_keys.size(); ++i) {
+            meta_spans.emplace_back(
+                reinterpret_cast<const char *>(meta_buffers[i]), meta_sizes[i]);
+        }
+
+        int meta_ret;
         {
             py::gil_scoped_release release_gil;
-            meta_results = store->batch_put_from(meta_keys, meta_buffers,
-                                                 meta_sizes, config);
+            meta_ret = store->put_batch(meta_keys, meta_spans, config);
         }
-        for (size_t j = 0; j < meta_indices.size(); ++j) {
-            if (meta_results[j] != 0) {
-                results[meta_indices[j]] = meta_results[j];
+        if (meta_ret != 0) {
+            for (size_t j = 0; j < meta_indices.size(); ++j) {
+                results[meta_indices[j]] = meta_ret;
             }
         }
     }
@@ -472,6 +482,7 @@ class MooncakeStorePyWrapper {
                                         int64_t r_start, int64_t r_end,
                                         int64_t r_size, size_t element_size) {
         constexpr size_t kChunkMetaSize = sizeof(ChunkMetadata);
+        auto total_start = std::chrono::steady_clock::now();
 
         // Use put_tp_size from metadata instead of hardcoded max
         const int put_tp_size = global_meta.put_tp_size;
@@ -489,10 +500,12 @@ class MooncakeStorePyWrapper {
         }
 
         std::vector<std::shared_ptr<BufferHandle>> chunk_meta_buffers;
+        auto chunk_meta_start = std::chrono::steady_clock::now();
         {
             py::gil_scoped_release release_gil;
             chunk_meta_buffers = store_->batch_get_buffer(chunk_meta_keys);
         }
+        auto chunk_meta_end = std::chrono::steady_clock::now();
 
         // Phase 2: Build keys, dest_offsets, src_offsets, sizes for CCRP
         std::vector<std::string> keys;
@@ -509,6 +522,9 @@ class MooncakeStorePyWrapper {
         int64_t slice_size_bytes = elements_after * element_size;
         constexpr size_t chunk_metadata_size = sizeof(TensorMetadata);
 
+        auto planning_start = std::chrono::steady_clock::now();
+        size_t total_transfer_bytes = 0;
+        size_t overlapping_chunks = 0;
         for (int writer_rank = 0;
              writer_rank < static_cast<int>(chunk_meta_buffers.size());
              writer_rank++) {
@@ -527,6 +543,7 @@ class MooncakeStorePyWrapper {
             int64_t inter_start = std::max(w_start, r_start);
             int64_t inter_end = std::min(w_end, r_end);
             if (inter_start >= inter_end) continue;
+            overlapping_chunks++;
 
             int64_t src_start = inter_start - w_start;
             int64_t dst_start = inter_start - r_start;
@@ -545,6 +562,7 @@ class MooncakeStorePyWrapper {
                 src_offsets.push_back(chunk_metadata_size +
                                       src_start * slice_size_bytes);
                 sizes.push_back(total_copy_size);
+                total_transfer_bytes += total_copy_size;
             } else {
                 for (int64_t slice_idx = 0; slice_idx < elements_before;
                      slice_idx++) {
@@ -559,22 +577,36 @@ class MooncakeStorePyWrapper {
                     dest_offsets.push_back(dst_slice_offset);
                     src_offsets.push_back(src_slice_offset);
                     sizes.push_back(copy_size);
+                    total_transfer_bytes += copy_size;
                 }
             }
         }
+        auto planning_end = std::chrono::steady_clock::now();
 
-        if (keys.empty()) return;
+        if (keys.empty()) {
+            return;
+        }
 
-        // Phase 3: Single batch_get_buffer_ranges call (CCRP, internal use
-        // only)
+        // Phase 3: Single batch_get_buffer_ranges call (CCRP, internal use only)
         std::vector<int64_t> batch_res;
+        auto transfer_start = std::chrono::steady_clock::now();
         {
             py::gil_scoped_release release_gil;
             RealClient *rc = static_cast<RealClient *>(store_.get());
             batch_res = rc->batch_get_buffer_ranges(
                 keys, output_data, dest_offsets, src_offsets, sizes);
         }
+        auto transfer_end = std::chrono::steady_clock::now();
         (void)batch_res;  // Results checked per-range; partial success allowed
+        (void)chunk_meta_start;
+        (void)chunk_meta_end;
+        (void)planning_start;
+        (void)planning_end;
+        (void)transfer_start;
+        (void)transfer_end;
+        (void)total_start;
+        (void)total_transfer_bytes;
+        (void)overlapping_chunks;
     }
 
     // Helper function to store chunk and global metadata for TP tensors
@@ -2021,7 +2053,12 @@ class MooncakeStorePyWrapper {
         }
 
         std::string tp_key = get_tp_key_name(key, tp_rank);
-        int ret = put_tensor_from(tp_key, buffer_ptr, size);
+        int ret;
+        {
+            py::gil_scoped_release release_gil;
+            ret = store_->put_from(tp_key, reinterpret_cast<void *>(buffer_ptr),
+                                   size, config);
+        }
         if (ret != 0) return ret;
 
         return store_tensor_tp_metadata(key, tp_rank, tp_size, split_dim,
@@ -2085,8 +2122,12 @@ class MooncakeStorePyWrapper {
         for (const auto &key : base_keys) {
             chunk_keys.push_back(get_tp_key_name(key, tp_rank));
         }
-        std::vector<int> results =
-            batch_put_tensor_from(chunk_keys, buffer_ptrs, sizes);
+        std::vector<int> results;
+        {
+            py::gil_scoped_release release_gil;
+            results = store_->batch_put_from(chunk_keys, CastAddrs2Ptrs(buffer_ptrs),
+                                             sizes, config);
+        }
 
         std::vector<TensorMetadata> tensor_metas(num_keys);
         std::vector<std::array<int64_t, 4>> full_shapes(num_keys);

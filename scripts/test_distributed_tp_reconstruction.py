@@ -6,6 +6,10 @@ Coordinates nodes via torch.distributed (gloo backend).
 Each node runs a local process pool for mooncake store workers.
 All put/get use zero-copy interfaces over RDMA (put_tensor_chunk_with_tp_from / put_tensor_from / put_tensor_with_tp_from / get_tensor_into / get_tensor_with_tp_into).
 
+Each iteration measures overlapped end-to-end makespan: local put workers and
+local get workers are launched together, and readers retry until data becomes
+visible.
+
 Test groups (each has its own independent put + get):
   1. CCRP (experimental): distributed put_tensor_chunk_with_tp_from + get_tensor_with_tp_into
   2. All Gather (control 1): node0 gathers + put_tensor_from (full tensor) + each reader get_tensor_into (full) + local slice
@@ -43,6 +47,32 @@ DTYPE_MAP = {
     torch.int64: 8, torch.uint64: 9, torch.bool: 10, torch.float16: 11,
     torch.bfloat16: 12,
 }
+GET_RETRY_TIMEOUT_SEC = 10.0
+GET_RETRY_INTERVAL_SEC = 0.01
+
+
+def _tp_data_key(base_key, rank):
+    return f"{base_key}_tp_{rank}"
+
+
+def _tp_meta_key(base_key, rank):
+    return f"{base_key}_tp_{rank}_meta"
+
+
+def _global_meta_key(base_key):
+    return f"{base_key}_global_meta"
+
+
+def _ready_key(base_key):
+    return f"{base_key}_ready"
+
+
+def _tp_ready_key(base_key, rank):
+    return f"{base_key}_ready_tp_{rank}"
+
+
+def _mark_ready(store, key):
+    return store.put(key, b"1") == 0
 
 
 # ── Helpers ──
@@ -112,9 +142,18 @@ def _put_worker(args):
         rc = _worker_store.put_tensor_chunk_with_tp_from(
             key, ptr, sz, tp_rank=put_rank, tp_size=put_tp, split_dim=split_dim
         )
-        return rc == 0
+        if rc != 0:
+            return False
+        return _mark_ready(_worker_store, _tp_ready_key(key, put_rank))
     finally:
         _worker_store.unregister_buffer(ptr)
+
+
+def _put_worker_from_tensor(args):
+    """CCRP put using a shared full tensor to avoid parent->worker chunk copies."""
+    put_rank, key, tensor, put_tp, split_dim = args
+    chunk = tensor.chunk(put_tp, split_dim)[put_rank]
+    return _put_worker((put_rank, key, chunk, put_tp, split_dim))
 
 
 def _get_worker(args):
@@ -152,7 +191,9 @@ def _put_full_tensor_worker(args):
         return False
     try:
         rc = _worker_store.put_tensor_from(key, ptr, sz)
-        return rc == 0
+        if rc != 0:
+            return False
+        return _mark_ready(_worker_store, _ready_key(key))
     finally:
         _worker_store.unregister_buffer(ptr)
 
@@ -194,7 +235,9 @@ def _put_gather_tp_worker(args):
         rc = store.put_tensor_with_tp_from(
             key, ptr, sz, tp_rank=0, tp_size=get_tp, split_dim=split_dim
         )
-        return rc == 0
+        if rc != 0:
+            return False
+        return _mark_ready(store, _ready_key(key))
     finally:
         store.unregister_buffer(ptr)
 
@@ -239,13 +282,74 @@ def _simulate_gathered_tensor(tensor, put_tp, split_dim):
     return torch.cat(list(tensor.chunk(put_tp, split_dim)), dim=split_dim).contiguous()
 
 
+def _ccrp_ready(store, key, put_tp):
+    for rank in range(put_tp):
+        if store.is_exist(_tp_ready_key(key, rank)) != 1:
+            return False
+    return True
+
+
+def _all_gather_ready(store, key):
+    return store.is_exist(_ready_key(key)) == 1
+
+
+def _gather_tp_ready(store, key, _get_tp):
+    return store.is_exist(_ready_key(key)) == 1
+
+
+def _get_with_retry(get_fn, ready_fn, args, timeout_s=GET_RETRY_TIMEOUT_SEC,
+                    interval_s=GET_RETRY_INTERVAL_SEC):
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        if ready_fn(*args):
+            return get_fn(args)
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(interval_s)
+
+
+def _get_worker_retry(args):
+    get_rank, key, tensor, get_tp, split_dim, put_tp = args
+    return _get_with_retry(
+        lambda inner_args: _get_worker(inner_args[:5]),
+        lambda _get_rank, key_name, _tensor, _get_tp, _split_dim, put_tp_size: _ccrp_ready(_worker_store, key_name, put_tp_size),
+        (get_rank, key, tensor, get_tp, split_dim, put_tp),
+    )
+
+
+def _get_full_tensor_worker_retry(args):
+    get_rank, key, tensor, get_tp, split_dim = args
+    return _get_with_retry(
+        _get_full_tensor_worker,
+        lambda _get_rank, key_name, _tensor, _get_tp, _split_dim: _all_gather_ready(_worker_store, key_name),
+        (get_rank, key, tensor, get_tp, split_dim),
+    )
+
+
+def _get_tp_chunk_worker_retry(args):
+    get_rank, key, tensor, get_tp, split_dim = args
+    return _get_with_retry(
+        _get_tp_chunk_worker,
+        lambda _get_rank, key_name, _tensor, get_tp_size, _split_dim: _gather_tp_ready(_worker_store, key_name, get_tp_size),
+        (get_rank, key, tensor, get_tp, split_dim),
+    )
+
+
+def _run_overlapped_iteration(pool, put_fn, put_args, get_fn, get_args):
+    put_async = pool.map_async(put_fn, put_args) if put_args else None
+    get_async = pool.map_async(get_fn, get_args) if get_args else None
+    put_results = put_async.get() if put_async is not None else []
+    get_results = get_async.get() if get_async is not None else []
+    return all(put_results), all(get_results)
+
+
 # ── Distributed test runner ──
 
 def run_distributed_case(pool, node_id, num_nodes, key, tensor,
                          put_tp, put_ranks_per_node,
                          get_tp, get_ranks_per_node,
                          split_dim, iters):
-    """Run one case across all nodes with end-to-end timing for put + get."""
+    """Run one case across all nodes with overlapped put/get timing."""
     put_rank_start = node_id * put_ranks_per_node
     get_rank_start = node_id * get_ranks_per_node
 
@@ -261,78 +365,69 @@ def run_distributed_case(pool, node_id, num_nodes, key, tensor,
     ccrp_times = []
     for it in range(iters):
         ccrp_key = f"{key}_ccrp_{it}"
-        chunks = list(tensor.chunk(put_tp, split_dim))
         put_args = [
-            (put_rank_start + r, ccrp_key, chunks[put_rank_start + r], put_tp, split_dim)
+            (put_rank_start + r, ccrp_key, tensor, put_tp, split_dim)
             for r in range(put_ranks_per_node)
+        ]
+        get_args = [
+            (get_rank_start + r, ccrp_key, tensor, get_tp, split_dim, put_tp)
+            for r in range(get_ranks_per_node)
         ]
         dist.barrier()
         t0 = time.perf_counter()
-        put_results = pool.map(_put_worker, put_args)
-        dist.barrier()
-        if not all(put_results):
-            print(f"  [Node {node_id}] CCRP put iter {it} FAILED")
-            continue
-        get_args = [
-            (get_rank_start + r, ccrp_key, tensor, get_tp, split_dim)
-            for r in range(get_ranks_per_node)
-        ]
-        results = pool.map(_get_worker, get_args)
+        put_ok, get_ok = _run_overlapped_iteration(
+            pool, _put_worker_from_tensor, put_args, _get_worker_retry, get_args
+        )
         local_elapsed = time.perf_counter() - t0
         global_elapsed = dist_max_time(local_elapsed)
-        if all(results):
+        if put_ok and get_ok:
             ccrp_times.append(global_elapsed)
-        else:
-            print(f"  [Node {node_id}] CCRP get iter {it} FAILED")
+        elif node_id == 0:
+            print(f"  CCRP iter {it} FAILED")
 
     all_gather_times = []
     for it in range(iters):
         ag_key = f"{key}_ag_{it}"
         gathered_tensor = _simulate_gathered_tensor(tensor, put_tp, split_dim)
-        dist.barrier()
-        t0 = time.perf_counter()
-        if node_id == 0:
-            ag_put = pool.map(_put_full_tensor_worker, [(ag_key, gathered_tensor)])
-            if not all(ag_put):
-                print(f"  [Node 0] All Gather put iter {it} FAILED")
-        dist.barrier()
+        put_args = [(ag_key, gathered_tensor)] if node_id == 0 else []
         get_args = [
             (get_rank_start + r, ag_key, tensor, get_tp, split_dim)
             for r in range(get_ranks_per_node)
         ]
-        results = pool.map(_get_full_tensor_worker, get_args)
+        dist.barrier()
+        t0 = time.perf_counter()
+        put_ok, get_ok = _run_overlapped_iteration(
+            pool, _put_full_tensor_worker, put_args,
+            _get_full_tensor_worker_retry, get_args
+        )
         local_elapsed = time.perf_counter() - t0
         global_elapsed = dist_max_time(local_elapsed)
-        if all(results):
+        if put_ok and get_ok:
             all_gather_times.append(global_elapsed)
-        else:
-            print(f"  [Node {node_id}] AllGather get iter {it} FAILED")
+        elif node_id == 0:
+            print(f"  AllGather iter {it} FAILED")
 
     gather_tp_times = []
     for it in range(iters):
         gtp_key = f"{key}_gtp_{it}"
         gathered_tensor = _simulate_gathered_tensor(tensor, put_tp, split_dim)
-        dist.barrier()
-        t0 = time.perf_counter()
-        if node_id == 0:
-            gtp_put = pool.map(
-                _put_gather_tp_worker,
-                [(gtp_key, gathered_tensor, get_tp, split_dim)]
-            )
-            if not all(gtp_put):
-                print(f"  [Node 0] Gather+TP put iter {it} FAILED")
-        dist.barrier()
+        put_args = [(gtp_key, gathered_tensor, get_tp, split_dim)] if node_id == 0 else []
         get_args = [
             (get_rank_start + r, gtp_key, tensor, get_tp, split_dim)
             for r in range(get_ranks_per_node)
         ]
-        results = pool.map(_get_tp_chunk_worker, get_args)
+        dist.barrier()
+        t0 = time.perf_counter()
+        put_ok, get_ok = _run_overlapped_iteration(
+            pool, _put_gather_tp_worker, put_args,
+            _get_tp_chunk_worker_retry, get_args
+        )
         local_elapsed = time.perf_counter() - t0
         global_elapsed = dist_max_time(local_elapsed)
-        if all(results):
+        if put_ok and get_ok:
             gather_tp_times.append(global_elapsed)
-        else:
-            print(f"  [Node {node_id}] Gather+TP get iter {it} FAILED")
+        elif node_id == 0:
+            print(f"  Gather+TP iter {it} FAILED")
 
     ag_mean = np.mean(all_gather_times) if all_gather_times else None
     ccrp_mean = np.mean(ccrp_times) if ccrp_times else None
@@ -454,8 +549,8 @@ def main():
     split_dims = [int(x) for x in args.split_dims.split(",")]
     put_tp = args.num_nodes * args.put_ranks_per_node
 
-    # Pool size = max of put ranks and all get ranks configs
-    max_local = max(args.put_ranks_per_node, max(get_ranks_list))
+    # Pool size must accommodate overlapped local put + get workers.
+    max_local = max(args.put_ranks_per_node + grpn for grpn in get_ranks_list)
     ctx = multiprocessing.get_context("spawn")
     pool = ctx.Pool(max_local, initializer=_init_worker_store)
 
@@ -468,7 +563,7 @@ def main():
                 continue
             cases.append((put_tp, args.put_ranks_per_node, get_tp, grpn, sd))
 
-    max_tp = max(put_tp, max(args.num_nodes * g for g in get_ranks_list))
+    max_split_tp = max(put_tp, max(args.num_nodes * g for g in get_ranks_list))
 
     if args.node_id == 0:
         print(f"\n=== Distributed TP Reconstruction Test (all zero-copy) ===")
@@ -489,7 +584,7 @@ def main():
         for i, (pt, prpn, gt, grpn, sd) in enumerate(cases):
             # Same seed on all nodes -> identical tensor
             torch.manual_seed(42 + i)
-            tensor = make_tensor_for_split_dim(sd, args.size_mb, max_tp)
+            tensor = make_tensor_for_split_dim(sd, args.size_mb, max_split_tp)
             key = f"dist_tp_{pt}_{gt}_{sd}_{i}"
 
             if args.node_id == 0:
