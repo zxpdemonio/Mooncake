@@ -100,37 +100,92 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+
+    // Phase 1: Resolve transports for all requests up front so we can
+    // determine grouping before touching the task_list.
+    struct ResolvedEntry {
+        size_t request_idx;
+        Transport *transport;
+    };
+    std::vector<ResolvedEntry> resolved;
+    resolved.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Transport *transport = nullptr;
+        auto status = selectTransport(entries[i], transport);
+        if (!status.ok()) return status;
+        assert(transport);
+        resolved.push_back({i, transport});
+    }
+
+    // Phase 2: Compute logical tasks by coalescing adjacent requests that
+    // share the same non-default task_group_id and the same transport.
+    // Each run of grouped requests becomes one logical task; ungrouped
+    // requests are each their own logical task.
+    struct LogicalTask {
+        size_t start;  // first index in resolved[]
+        size_t count;  // number of entries in this logical task
+        Transport *transport;
+    };
+    std::vector<LogicalTask> logical_tasks;
+    logical_tasks.reserve(entries.size());  // upper bound
+    {
+        size_t i = 0;
+        while (i < resolved.size()) {
+            const auto &req = entries[resolved[i].request_idx];
+            Transport *tp = resolved[i].transport;
+            if (req.task_group_id != TransferRequest::kNoTaskGroup) {
+                // Try to extend the group with adjacent requests.
+                size_t group_start = i;
+                uint64_t gid = req.task_group_id;
+                while (i < resolved.size() &&
+                       entries[resolved[i].request_idx].task_group_id == gid &&
+                       resolved[i].transport == tp) {
+                    ++i;
+                }
+                logical_tasks.push_back({group_start, i - group_start, tp});
+            } else {
+                logical_tasks.push_back({i, 1, tp});
+                ++i;
+            }
+        }
+    }
+
+    size_t num_logical = logical_tasks.size();
+    if (batch_desc.task_list.size() + num_logical > batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
     }
 
+    // Phase 3: Allocate logical tasks in the batch and populate them.
     size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    batch_desc.task_list.resize(task_id + num_logical);
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *>>
         submit_tasks;
-    for (auto &request : entries) {
-        Transport *transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
+    for (size_t lt = 0; lt < num_logical; ++lt) {
+        auto &ltask = logical_tasks[lt];
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        // Point to the first request of this logical task.
+        const auto &first_req = entries[resolved[ltask.start].request_idx];
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest *>(&request);
+        task.request = const_cast<Transport::TransferRequest *>(&first_req);
 #else
-        task.request = &request;
+        task.request = &first_req;
 #endif
+        // For grouped tasks the total_bytes covers all requests in the group.
+        // The transport's submitTransferTask will handle the actual slicing.
+        // Note: total_bytes is set by the transport layer when slicing, so
+        // we don't need to aggregate it here.  We just ensure the task is
+        // created and associated with the correct transport.
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        submit_tasks[ltask.transport].push_back(&task);
     }
+
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
-            // LOG(ERROR) << "Failed to submit transfer task to "
-            //            << entry.first->getName();
             overall_status = status;
         }
     }
