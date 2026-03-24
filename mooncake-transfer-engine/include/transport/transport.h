@@ -303,6 +303,10 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
+        // Grouped logical tasks may carry multiple adjacent requests that
+        // should be submitted as one transport task.
+        std::vector<TransferRequest> request_group;
+
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {

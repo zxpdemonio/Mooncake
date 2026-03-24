@@ -173,10 +173,17 @@ Status MultiTransport::submitTransfer(
 #else
         task.request = &first_req;
 #endif
+        if (ltask.count > 1) {
+            task.request_group.reserve(ltask.count);
+            for (size_t offset = 0; offset < ltask.count; ++offset) {
+                task.request_group.push_back(
+                    entries[resolved[ltask.start + offset].request_idx]);
+            }
+        }
         // For grouped tasks the total_bytes covers all requests in the group.
         // The transport's submitTransferTask will handle the actual slicing.
         // Note: total_bytes is set by the transport layer when slicing, so
-        // we don't need to aggregate it here.  We just ensure the task is
+        // we don't need to aggregate it here. We just ensure the task is
         // created and associated with the correct transport.
         ++task_id;
         submit_tasks[ltask.transport].push_back(&task);
