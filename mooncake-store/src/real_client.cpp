@@ -2444,8 +2444,8 @@ tl::expected<QueryResult, ErrorCode> RealClient::query_with_retry(
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::get_range_with_query_result(
-    const QueryResult &query_result, const std::string &key,
-    void *dest_buffer, size_t dest_offset, size_t source_offset, size_t size) {
+    const QueryResult &query_result, const std::string &key, void *dest_buffer,
+    size_t dest_offset, size_t source_offset, size_t size) {
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.replicas;
 
@@ -2486,8 +2486,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_range_with_query_result(
         }
     }
 
-    auto get_result =
-        client_->Get(key, query_result, slices, source_offset);
+    auto get_result = client_->Get(key, query_result, slices, source_offset);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -2562,9 +2561,9 @@ std::vector<int64_t> RealClient::batch_get_buffer_ranges(
             continue;
         }
 
-        auto ret = get_range_with_query_result(
-            it->second.value(), keys[i], dest_buffer, dest_offsets[i],
-            src_offsets[i], sizes[i]);
+        auto ret = get_range_with_query_result(it->second.value(), keys[i],
+                                               dest_buffer, dest_offsets[i],
+                                               src_offsets[i], sizes[i]);
         if (ret) {
             results[i] = static_cast<int64_t>(sizes[i]);
         } else {

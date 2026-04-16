@@ -1560,8 +1560,8 @@ class MooncakeStorePyWrapper {
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
         std::vector<size_t> processed_indices;
-        std::vector<int> final_results(
-            base_keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+        std::vector<int> final_results(base_keys.size(),
+                                       to_py_ret(ErrorCode::INVALID_PARAMS));
 
         // Track per-tensor info for metadata writing
         std::vector<PyTensorInfo> tensor_infos(base_keys.size());
@@ -2190,8 +2190,8 @@ class MooncakeStorePyWrapper {
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0,
-        const std::optional<std::vector<std::vector<int64_t>>> &full_shapes_arg =
-            std::nullopt) {
+        const std::optional<std::vector<std::vector<int64_t>>>
+            &full_shapes_arg = std::nullopt) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return std::vector<int>(base_keys.size(),

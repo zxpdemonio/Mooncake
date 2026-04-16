@@ -821,7 +821,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
-
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
