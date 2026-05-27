@@ -93,7 +93,10 @@ uint32_t RoundUpToKvTransferBytes(uint32_t bytes, uint32_t kvcg) {
     if (bytes == 0) {
         return 0;
     }
-    return ((bytes + kvcg - 1u) / kvcg) * kvcg;
+    const uint64_t rounded =
+        ((static_cast<uint64_t>(bytes) + kvcg - 1u) / kvcg) * kvcg;
+    return static_cast<uint32_t>(
+        std::min(rounded, static_cast<uint64_t>(UINT32_MAX)));
 }
 
 tl::expected<uint32_t, ErrorCode> ComputeKvBlockCountMinusOne(uint32_t bytes,
@@ -101,7 +104,8 @@ tl::expected<uint32_t, ErrorCode> ComputeKvBlockCountMinusOne(uint32_t bytes,
     if (bytes == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return (bytes + kvcg - 1u) / kvcg - 1u;
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(bytes) + kvcg - 1u) / kvcg - 1u);
 }
 
 bool ShouldTraceCommands() {
@@ -202,25 +206,26 @@ std::optional<NvmeKvCommandExecutor::Capabilities> ParseKvIdentifyNamespace(
     return caps;
 }
 
-ErrorCode MapTransportError(int err, bool is_write) {
-    // Negative err = errno from system call failure.
-    if (err == ENOENT) {
-        return ErrorCode::OBJECT_NOT_FOUND;
+ErrorCode MapErrno(int err_no, bool is_write) {
+    switch (err_no) {
+        case ENOENT:
+            return ErrorCode::OBJECT_NOT_FOUND;
+        case ENOSPC:
+            return ErrorCode::KEYS_ULTRA_LIMIT;
+        case EINVAL:
+            return ErrorCode::INVALID_PARAMS;
+        case ENOMEM:
+            return ErrorCode::BUFFER_OVERFLOW;
+        default:
+            return is_write ? ErrorCode::FILE_WRITE_FAIL
+                            : ErrorCode::FILE_READ_FAIL;
     }
-    if (err == ENOSPC) {
-        return ErrorCode::KEYS_ULTRA_LIMIT;
-    }
-    if (err == EINVAL) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    if (err == ENOMEM) {
-        return ErrorCode::BUFFER_OVERFLOW;
-    }
+}
 
-    // Positive err = NVMe CQE status word from ioctl passthrough.
+ErrorCode MapNvmeStatus(int status, bool is_write) {
     // Match on SCT+SC (lower 11 bits), ignoring DNR/More/CRD.
-    const uint32_t nvme_status = static_cast<uint32_t>(err) & kNvmeStatusMask;
-    switch (nvme_status) {
+    const uint32_t nvme_sc = static_cast<uint32_t>(status) & kNvmeStatusMask;
+    switch (nvme_sc) {
         case kNvmeScKvKeyNotExists:
             return ErrorCode::OBJECT_NOT_FOUND;
         case kNvmeScKvKeyExists:
@@ -267,68 +272,69 @@ std::vector<NvmeKvCommandExecutor::PhysicalKey> ParseListBuffer(
     return keys;
 }
 
+// Open and validate an NVMe device path, returning the fd or an error.
+tl::expected<int, ErrorCode> OpenNvmeDevice(const std::string& device_path) {
+    struct stat st{};
+    if (::stat(device_path.c_str(), &st) != 0) {
+        LOG(ERROR) << "[NvmeKvIoctlExecutor] stat failed for " << device_path
+                   << ": " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
+        LOG(ERROR) << "[NvmeKvIoctlExecutor] " << device_path
+                   << " is not a character or block device";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const int fd = ::open(device_path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "[NvmeKvIoctlExecutor] open failed for " << device_path
+                   << ": " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return fd;
+}
+
+// Probe KV namespace capabilities via Identify command.
+std::optional<NvmeKvCommandExecutor::Capabilities> ProbeKvCapabilities(
+    int fd, uint32_t nsid, const std::string& device_path) {
+    std::vector<uint8_t> data(kNvmeIdentifyDataSize);
+    nvme_passthru_cmd64 cmd{};
+    cmd.opcode = kNvmeAdminIdentifyOpcode;
+    cmd.nsid = nsid;
+    cmd.addr = reinterpret_cast<uint64_t>(data.data());
+    cmd.data_len = static_cast<uint32_t>(data.size());
+    cmd.cdw10 = kNvmeIdentifyCsiNamespace;
+    cmd.cdw11 = static_cast<uint32_t>(kNvmeKvCommandSetIndicator) << 24;
+    cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+
+    const int ret = ::ioctl(fd, NVME_IOCTL_ADMIN64_CMD, &cmd);
+    if (ret != 0) {
+        LOG(WARNING) << "[NvmeKvIoctlExecutor] capability probe failed for "
+                     << device_path << ", using conservative fallback: "
+                     << (ret < 0 ? strerror(errno) : "command failed");
+        return std::nullopt;
+    }
+    auto caps = ParseKvIdentifyNamespace(data);
+    if (!caps) {
+        LOG(WARNING) << "[NvmeKvIoctlExecutor] capability probe returned "
+                        "invalid data for "
+                     << device_path << ", using conservative fallback";
+    }
+    return caps;
+}
+
 class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
    public:
+    // Takes ownership of an already-opened file descriptor.
     NvmeKvIoctlExecutor(std::string device_path, uint32_t nsid,
-                        Capabilities capabilities)
+                        Capabilities capabilities, int fd)
         : device_path_(std::move(device_path)),
           nsid_(nsid),
-          capabilities_(capabilities) {}
+          capabilities_(capabilities),
+          fd_(fd) {}
 
     NvmeKvIoctlExecutor(const NvmeKvIoctlExecutor&) = delete;
     NvmeKvIoctlExecutor& operator=(const NvmeKvIoctlExecutor&) = delete;
-
-    tl::expected<void, ErrorCode> Init() {
-        struct stat st{};
-        if (::stat(device_path_.c_str(), &st) != 0) {
-            LOG(ERROR) << "[NvmeKvIoctlExecutor] stat failed for "
-                       << device_path_ << ": " << strerror(errno);
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
-            LOG(ERROR) << "[NvmeKvIoctlExecutor] " << device_path_
-                       << " is not a character or block device";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        fd_ = ::open(device_path_.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd_ < 0) {
-            LOG(ERROR) << "[NvmeKvIoctlExecutor] open failed for "
-                       << device_path_ << ": " << strerror(errno);
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        return {};
-    }
-
-    std::optional<Capabilities> ProbeCapabilities() const {
-        std::vector<uint8_t> data(kNvmeIdentifyDataSize);
-        nvme_passthru_cmd64 cmd{};
-        cmd.opcode = kNvmeAdminIdentifyOpcode;
-        cmd.nsid = nsid_;
-        cmd.addr = reinterpret_cast<uint64_t>(data.data());
-        cmd.data_len = static_cast<uint32_t>(data.size());
-        cmd.cdw10 = kNvmeIdentifyCsiNamespace;
-        cmd.cdw11 = static_cast<uint32_t>(kNvmeKvCommandSetIndicator) << 24;
-        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
-
-        const int ret = ::ioctl(fd_, NVME_IOCTL_ADMIN64_CMD, &cmd);
-        if (ret != 0) {
-            LOG(WARNING) << "[NvmeKvIoctlExecutor] capability probe failed for "
-                         << device_path_ << ", using conservative fallback: "
-                         << (ret < 0 ? strerror(errno) : "command failed");
-            return std::nullopt;
-        }
-        auto caps = ParseKvIdentifyNamespace(data);
-        if (!caps) {
-            LOG(WARNING) << "[NvmeKvIoctlExecutor] capability probe returned "
-                            "invalid data for "
-                         << device_path_ << ", using conservative fallback";
-        }
-        return caps;
-    }
-
-    void SetCapabilities(Capabilities capabilities) {
-        capabilities_ = capabilities;
-    }
 
     ~NvmeKvIoctlExecutor() override {
         if (fd_ >= 0) {
@@ -558,7 +564,8 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         const int ret = ::ioctl(fd_, NVME_IOCTL_IO64_CMD, &cmd);
         if (ret != 0) {
             const int err = (ret < 0) ? errno : ret;
-            const ErrorCode mapped = MapTransportError(err, is_write);
+            const ErrorCode mapped = (ret < 0) ? MapErrno(err, is_write)
+                                               : MapNvmeStatus(err, is_write);
             TraceCommandResult(op_name, key, cmd, -err, mapped, false,
                                cmd.result);
             return tl::make_unexpected(mapped);
@@ -588,27 +595,28 @@ std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvIoctlExecutor(
     fallback_caps.effective_max_value_size = fallback_limit;
     fallback_caps.kvcg = kDefaultKvcgBytes;
 
-    auto executor = std::make_unique<NvmeKvIoctlExecutor>(
-        std::move(device_path), nsid, fallback_caps);
-    auto init_res = executor->Init();
-    if (!init_res) {
-        capabilities = tl::make_unexpected(init_res.error());
+    auto fd_result = OpenNvmeDevice(device_path);
+    if (!fd_result) {
+        capabilities = tl::make_unexpected(fd_result.error());
         return nullptr;
     }
+    const int fd = fd_result.value();
 
-    auto probed_caps = executor->ProbeCapabilities();
+    auto probed_caps = ProbeKvCapabilities(fd, nsid, device_path);
     NvmeKvCommandExecutor::Capabilities caps =
         probed_caps.value_or(fallback_caps);
     if (caps.max_key_size < kMooncakePhysicalKeySize) {
         LOG(ERROR) << "[NvmeKvIoctlExecutor] device max key size "
                    << caps.max_key_size << " is smaller than Mooncake key size "
                    << kMooncakePhysicalKeySize;
+        ::close(fd);
         capabilities = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         return nullptr;
     }
-    executor->SetCapabilities(caps);
+
     capabilities = caps;
-    return executor;
+    return std::make_unique<NvmeKvIoctlExecutor>(std::move(device_path), nsid,
+                                                 caps, fd);
 }
 
 std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvExecutor(
