@@ -47,11 +47,17 @@ class NvmeKvCommandExecutor {
         if (!res) {
             return tl::make_unexpected(res.error());
         }
-        if (res.value().size() > buffer_size) {
+        const auto& val = res.value();
+        if (val.size() > buffer_size) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        std::memcpy(buffer, res.value().data(), res.value().size());
-        return static_cast<uint32_t>(res.value().size());
+        if (!val.empty()) {
+            if (buffer == nullptr) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            std::memcpy(buffer, val.data(), val.size());
+        }
+        return static_cast<uint32_t>(val.size());
     }
     virtual tl::expected<bool, ErrorCode> Exists(
         const PhysicalKey& key) const = 0;
@@ -64,7 +70,8 @@ class NvmeKvCommandExecutor {
     // List keys on the device matching a prefix.
     // prefix_len=0 means list all keys. Returns up to max_keys results.
     // When more keys exist than fit in the buffer, returns a partial result;
-    // the caller should invoke again with the last key as the new prefix.
+    // the caller should invoke again using the last returned key as the
+    // start key for the next batch.
     virtual tl::expected<std::vector<PhysicalKey>, ErrorCode> List(
         const PhysicalKey& prefix, uint8_t prefix_len,
         uint32_t max_keys = 1024) const = 0;

@@ -343,11 +343,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.timeout_ms = kNvmeIoctlTimeoutMs;
 
         const PhysicalKey dummy_key{};
-        auto result = Submit(cmd, true, "flush", dummy_key);
-        if (!result) {
-            return tl::make_unexpected(result.error());
-        }
-        return {};
+        return SubmitVoid(cmd, true, "flush", dummy_key);
     }
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
@@ -384,11 +380,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.timeout_ms = kNvmeIoctlTimeoutMs;
         EncodeKeyIntoCommand(key, cmd);
 
-        auto result = Submit(cmd, true, "store", key);
-        if (!result) {
-            return tl::make_unexpected(result.error());
-        }
-        return {};
+        return SubmitVoid(cmd, true, "store", key);
     }
 
     tl::expected<std::string, ErrorCode> Retrieve(
@@ -418,16 +410,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<bool, ErrorCode> Exists(
         const PhysicalKey& key) const override {
-        nvme_passthru_cmd64 cmd{};
-        cmd.opcode = kNvmeKvExistOpcode;
-        cmd.nsid = nsid_;
-        cmd.cdw10 = 0;
-        cmd.cdw11 = BuildKeyLengthField(key.size());
-        cmd.cdw12 = 0;
-        cmd.cdw13 = 0;
-        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
-        EncodeKeyIntoCommand(key, cmd);
-
+        auto cmd = BuildKeyOnlyCommand(kNvmeKvExistOpcode, key);
         auto result = Submit(cmd, false, "exists", key);
         if (!result) {
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
@@ -439,26 +422,19 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
     }
 
     tl::expected<void, ErrorCode> Delete(const PhysicalKey& key) override {
-        nvme_passthru_cmd64 cmd{};
-        cmd.opcode = kNvmeKvDeleteOpcode;
-        cmd.nsid = nsid_;
-        cmd.cdw10 = 0;
-        cmd.cdw11 = BuildKeyLengthField(key.size());
-        cmd.cdw12 = 0;
-        cmd.cdw13 = 0;
-        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
-        EncodeKeyIntoCommand(key, cmd);
-
-        auto result = Submit(cmd, true, "delete", key);
-        if (!result) {
-            return tl::make_unexpected(result.error());
-        }
-        return {};
+        auto cmd = BuildKeyOnlyCommand(kNvmeKvDeleteOpcode, key);
+        return SubmitVoid(cmd, true, "delete", key);
     }
 
     tl::expected<std::vector<PhysicalKey>, ErrorCode> List(
         const PhysicalKey& prefix, uint8_t prefix_len,
         uint32_t max_keys) const override {
+        if (prefix_len > sizeof(PhysicalKey)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (max_keys == 0) {
+            return std::vector<PhysicalKey>{};
+        }
         // Buffer layout: 4-byte num_keys + 4-byte reserved + entries
         // Each entry: 2-byte key_length + key_data
         const uint32_t kvcg = capabilities_.kvcg;
@@ -519,6 +495,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         if (dma_buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        std::memset(dma_buffer.get(), 0, max_size);
         nvme_passthru_cmd64 cmd{};
         cmd.opcode = kNvmeKvRetrieveOpcode;
         cmd.nsid = nsid_;
@@ -550,21 +527,39 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         return RawResult{std::move(dma_buffer), actual_size};
     }
 
+    nvme_passthru_cmd64 BuildKeyOnlyCommand(uint8_t opcode,
+                                            const PhysicalKey& key) const {
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = opcode;
+        cmd.nsid = nsid_;
+        cmd.cdw10 = 0;
+        cmd.cdw11 = BuildKeyLengthField(key.size());
+        cmd.cdw12 = 0;
+        cmd.cdw13 = 0;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+        EncodeKeyIntoCommand(key, cmd);
+        return cmd;
+    }
+
+    tl::expected<void, ErrorCode> SubmitVoid(nvme_passthru_cmd64& cmd,
+                                             bool is_write, const char* op_name,
+                                             const PhysicalKey& key) const {
+        auto result = Submit(cmd, is_write, op_name, key);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+        return {};
+    }
+
     tl::expected<uint32_t, ErrorCode> Submit(nvme_passthru_cmd64& cmd,
                                              bool is_write, const char* op_name,
                                              const PhysicalKey& key) const {
         TraceCommandBuild(op_name, key, cmd);
         const int ret = ::ioctl(fd_, NVME_IOCTL_IO64_CMD, &cmd);
-        if (ret < 0) {
-            const int err = errno;
+        if (ret != 0) {
+            const int err = (ret < 0) ? errno : ret;
             const ErrorCode mapped = MapTransportError(err, is_write);
             TraceCommandResult(op_name, key, cmd, -err, mapped, false,
-                               cmd.result);
-            return tl::make_unexpected(mapped);
-        }
-        if (ret > 0) {
-            const ErrorCode mapped = MapTransportError(ret, is_write);
-            TraceCommandResult(op_name, key, cmd, -ret, mapped, false,
                                cmd.result);
             return tl::make_unexpected(mapped);
         }
