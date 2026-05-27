@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <linux/nvme_ioctl.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -239,7 +240,21 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
           nsid_(nsid),
           capabilities_(capabilities) {}
 
+    NvmeKvIoctlExecutor(const NvmeKvIoctlExecutor&) = delete;
+    NvmeKvIoctlExecutor& operator=(const NvmeKvIoctlExecutor&) = delete;
+
     tl::expected<void, ErrorCode> Init() {
+        struct stat st{};
+        if (::stat(device_path_.c_str(), &st) != 0) {
+            LOG(ERROR) << "[NvmeKvIoctlExecutor] stat failed for "
+                       << device_path_ << ": " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
+            LOG(ERROR) << "[NvmeKvIoctlExecutor] " << device_path_
+                       << " is not a character or block device";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         fd_ = ::open(device_path_.c_str(), O_RDWR | O_CLOEXEC);
         if (fd_ < 0) {
             LOG(ERROR) << "[NvmeKvIoctlExecutor] open failed for "
@@ -288,7 +303,8 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
                                         std::string value) override {
-        if (value.size() > capabilities_.effective_max_value_size) {
+        if (value.empty() ||
+            value.size() > capabilities_.effective_max_value_size) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -326,85 +342,27 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<std::string, ErrorCode> Retrieve(
         const PhysicalKey& key) const override {
-        auto dma_buffer =
-            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
-        if (dma_buffer == nullptr) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        auto raw = RawRetrieve(key, "retrieve");
+        if (!raw) {
+            return tl::make_unexpected(raw.error());
         }
-        nvme_passthru_cmd64 cmd{};
-        cmd.opcode = kNvmeKvRetrieveOpcode;
-        cmd.nsid = nsid_;
-        cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
-        cmd.data_len = capabilities_.effective_max_value_size;
-        cmd.cdw10 = capabilities_.effective_max_value_size;
-        cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count =
-            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
-        if (!block_count) {
-            return tl::make_unexpected(block_count.error());
-        }
-        cmd.cdw12 = block_count.value();
-        cmd.cdw13 = 0;
-        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
-        EncodeKeyIntoCommand(key, cmd);
-
-        auto result = Submit(cmd, false, "retrieve", key);
-        if (!result) {
-            return tl::make_unexpected(result.error());
-        }
-
-        const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
-            dma_buffer.get(), result.value(),
-            capabilities_.effective_max_value_size);
-        if (actual_size == 0 ||
-            actual_size > capabilities_.effective_max_value_size) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        return std::string(dma_buffer.get(), dma_buffer.get() + actual_size);
+        auto& [buf, size] = raw.value();
+        return std::string(buf.get(), buf.get() + size);
     }
 
     tl::expected<uint32_t, ErrorCode> RetrieveInto(
         const PhysicalKey& key, void* buffer,
         uint32_t buffer_size) const override {
-        auto dma_buffer =
-            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
-        if (dma_buffer == nullptr) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        auto raw = RawRetrieve(key, "retrieve_into");
+        if (!raw) {
+            return tl::make_unexpected(raw.error());
         }
-        nvme_passthru_cmd64 cmd{};
-        cmd.opcode = kNvmeKvRetrieveOpcode;
-        cmd.nsid = nsid_;
-        cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
-        cmd.data_len = capabilities_.effective_max_value_size;
-        cmd.cdw10 = capabilities_.effective_max_value_size;
-        cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count =
-            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
-        if (!block_count) {
-            return tl::make_unexpected(block_count.error());
-        }
-        cmd.cdw12 = block_count.value();
-        cmd.cdw13 = 0;
-        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
-        EncodeKeyIntoCommand(key, cmd);
-
-        auto result = Submit(cmd, false, "retrieve_into", key);
-        if (!result) {
-            return tl::make_unexpected(result.error());
-        }
-
-        const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
-            dma_buffer.get(), result.value(),
-            capabilities_.effective_max_value_size);
-        if (actual_size == 0 ||
-            actual_size > capabilities_.effective_max_value_size) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        if (actual_size > buffer_size) {
+        auto& [buf, size] = raw.value();
+        if (size > buffer_size) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        std::memcpy(buffer, dma_buffer.get(), actual_size);
-        return actual_size;
+        std::memcpy(buffer, buf.get(), size);
+        return size;
     }
 
     tl::expected<bool, ErrorCode> Exists(
@@ -436,6 +394,47 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
     std::string GetBackendType() const override { return "ioctl"; }
 
    private:
+    using RawResult = std::pair<AlignedUniquePtr<char>, uint32_t>;
+
+    tl::expected<RawResult, ErrorCode> RawRetrieve(const PhysicalKey& key,
+                                                   const char* op_name) const {
+        auto dma_buffer =
+            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
+        if (dma_buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = kNvmeKvRetrieveOpcode;
+        cmd.nsid = nsid_;
+        cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
+        cmd.data_len = capabilities_.effective_max_value_size;
+        cmd.cdw10 = capabilities_.effective_max_value_size;
+        cmd.cdw11 = BuildKeyLengthField(key.size());
+        auto block_count =
+            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
+        if (!block_count) {
+            return tl::make_unexpected(block_count.error());
+        }
+        cmd.cdw12 = block_count.value();
+        cmd.cdw13 = 0;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+        EncodeKeyIntoCommand(key, cmd);
+
+        auto result = Submit(cmd, false, op_name, key);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+
+        const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
+            dma_buffer.get(), result.value(),
+            capabilities_.effective_max_value_size);
+        if (actual_size == 0 ||
+            actual_size > capabilities_.effective_max_value_size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        return RawResult{std::move(dma_buffer), actual_size};
+    }
+
     tl::expected<uint32_t, ErrorCode> Submit(nvme_passthru_cmd64& cmd,
                                              bool is_write, const char* op_name,
                                              const PhysicalKey& key) const {

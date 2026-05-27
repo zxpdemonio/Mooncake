@@ -77,6 +77,9 @@ uint32_t ResolveNvmeKvObjectValueSize(const char* buffer,
         header.version != NvmeKvObjectHeader::kVersion) {
         return 0;
     }
+    if (header.header_checksum != ComputeNvmeKvHeaderChecksum(header)) {
+        return 0;
+    }
 
     const uint64_t object_size =
         static_cast<uint64_t>(sizeof(NvmeKvObjectHeader)) + header.payload_size;
@@ -89,10 +92,14 @@ uint32_t ResolveNvmeKvObjectValueSize(const char* buffer,
 std::string SerializeNvmeKvManifest(
     const NvmeKvManifestMetadata& metadata,
     const std::vector<NvmeKvManifestChunkRecord>& chunk_records) {
-    std::string manifest(reinterpret_cast<const char*>(&metadata),
-                         sizeof(metadata));
-    for (const auto& record : chunk_records) {
-        manifest.append(reinterpret_cast<const char*>(&record), sizeof(record));
+    std::string manifest;
+    manifest.reserve(sizeof(metadata) +
+                     chunk_records.size() * sizeof(NvmeKvManifestChunkRecord));
+    manifest.append(reinterpret_cast<const char*>(&metadata), sizeof(metadata));
+    if (!chunk_records.empty()) {
+        manifest.append(
+            reinterpret_cast<const char*>(chunk_records.data()),
+            chunk_records.size() * sizeof(NvmeKvManifestChunkRecord));
     }
     return manifest;
 }
@@ -105,8 +112,8 @@ bool ParseNvmeKvManifest(
     }
     std::memcpy(&metadata, manifest_payload.data(), sizeof(metadata));
     const size_t records_bytes = manifest_payload.size() - sizeof(metadata);
-    if (records_bytes !=
-        metadata.chunk_count * sizeof(NvmeKvManifestChunkRecord)) {
+    if (records_bytes != static_cast<size_t>(metadata.chunk_count) *
+                             sizeof(NvmeKvManifestChunkRecord)) {
         return false;
     }
     chunk_records.resize(metadata.chunk_count);

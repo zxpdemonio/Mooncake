@@ -1,12 +1,24 @@
 #include "nvme_kv_key_codec.h"
 
+#include <cstdio>
 #include <cstring>
-#include <iomanip>
-#include <sstream>
 
 #include <xxhash.h>
 
 namespace mooncake {
+
+namespace {
+
+constexpr char kHexDigits[] = "0123456789abcdef";
+
+int HexCharValue(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+}  // namespace
 
 uint32_t ComputeNvmeKvChecksum(std::span<const uint8_t> data) {
     return static_cast<uint32_t>(XXH32(data.data(), data.size(), 0));
@@ -14,28 +26,55 @@ uint32_t ComputeNvmeKvChecksum(std::span<const uint8_t> data) {
 
 std::array<uint8_t, 32> ComputeNvmeKvVerifyHash(const std::string& key) {
     std::array<uint8_t, 32> hash{};
-    const std::string seed0 = "verify:0:" + key;
-    const std::string seed1 = "verify:1:" + key;
-    const std::string seed2 = "verify:2:" + key;
-    const std::string seed3 = "verify:3:" + key;
-    const uint64_t h0 = XXH64(seed0.data(), seed0.size(), 0);
-    const uint64_t h1 = XXH64(seed1.data(), seed1.size(), 0);
-    const uint64_t h2 = XXH64(seed2.data(), seed2.size(), 0);
-    const uint64_t h3 = XXH64(seed3.data(), seed3.size(), 0);
-    std::memcpy(hash.data(), &h0, sizeof(h0));
-    std::memcpy(hash.data() + 8, &h1, sizeof(h1));
-    std::memcpy(hash.data() + 16, &h2, sizeof(h2));
-    std::memcpy(hash.data() + 24, &h3, sizeof(h3));
+    static constexpr std::string_view kPrefixes[] = {
+        "verify:0:", "verify:1:", "verify:2:", "verify:3:"};
+    std::string buf;
+    buf.reserve(kPrefixes[0].size() + key.size());
+    uint64_t hashes[4];
+    for (int i = 0; i < 4; ++i) {
+        buf.assign(kPrefixes[i]);
+        buf.append(key);
+        hashes[i] = XXH64(buf.data(), buf.size(), 0);
+    }
+    std::memcpy(hash.data(), hashes, sizeof(hashes));
     return hash;
 }
 
-std::string NvmeKvPhysicalKeyToHex(const NvmeKvPhysicalKey& physical_key) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (uint8_t b : physical_key) {
-        oss << std::setw(2) << static_cast<int>(b);
+std::string HexEncode(std::string_view data) {
+    std::string result;
+    result.resize(data.size() * 2);
+    for (size_t i = 0; i < data.size(); ++i) {
+        const auto byte = static_cast<uint8_t>(data[i]);
+        result[i * 2] = kHexDigits[byte >> 4];
+        result[i * 2 + 1] = kHexDigits[byte & 0x0F];
     }
-    return oss.str();
+    return result;
+}
+
+bool HexDecode(std::string_view encoded, std::string& value) {
+    if (encoded.size() % 2 != 0) {
+        return false;
+    }
+    value.clear();
+    value.reserve(encoded.size() / 2);
+    for (size_t i = 0; i < encoded.size(); i += 2) {
+        const int high = HexCharValue(encoded[i]);
+        const int low = HexCharValue(encoded[i + 1]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        value.push_back(static_cast<char>((high << 4) | low));
+    }
+    return true;
+}
+
+std::string NvmeKvPhysicalKeyToHex(const NvmeKvPhysicalKey& physical_key) {
+    char buf[32];
+    for (size_t i = 0; i < physical_key.size(); ++i) {
+        buf[i * 2] = kHexDigits[physical_key[i] >> 4];
+        buf[i * 2 + 1] = kHexDigits[physical_key[i] & 0x0F];
+    }
+    return std::string(buf, 32);
 }
 
 bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
@@ -44,16 +83,8 @@ bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
         return false;
     }
     for (size_t i = 0; i < physical_key.size(); ++i) {
-        const auto hi = physical_key_hex[i * 2];
-        const auto lo = physical_key_hex[i * 2 + 1];
-        const auto hex_value = [](char ch) -> int {
-            if (ch >= '0' && ch <= '9') return ch - '0';
-            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-            return -1;
-        };
-        const int high = hex_value(hi);
-        const int low = hex_value(lo);
+        const int high = HexCharValue(physical_key_hex[i * 2]);
+        const int low = HexCharValue(physical_key_hex[i * 2 + 1]);
         if (high < 0 || low < 0) {
             return false;
         }
@@ -64,10 +95,14 @@ bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
 
 NvmeKvPhysicalKey EncodeNvmeKvPhysicalKey(const std::string& key) {
     NvmeKvPhysicalKey physical_key{};
-    const std::string seed0 = "pk:0:" + key;
-    const std::string seed1 = "pk:1:" + key;
-    const uint64_t h0 = XXH64(seed0.data(), seed0.size(), 0);
-    const uint64_t h1 = XXH64(seed1.data(), seed1.size(), 0);
+    std::string buf;
+    buf.reserve(5 + key.size());
+    buf.assign("pk:0:");
+    buf.append(key);
+    const uint64_t h0 = XXH64(buf.data(), buf.size(), 0);
+    buf.assign("pk:1:");
+    buf.append(key);
+    const uint64_t h1 = XXH64(buf.data(), buf.size(), 0);
     std::memcpy(physical_key.data(), &h0, sizeof(h0));
     std::memcpy(physical_key.data() + 8, &h1, sizeof(h1));
     return physical_key;
@@ -76,11 +111,21 @@ NvmeKvPhysicalKey EncodeNvmeKvPhysicalKey(const std::string& key) {
 NvmeKvPhysicalKey EncodeNvmeKvChunkPhysicalKey(const std::string& key,
                                                uint32_t chunk_index) {
     NvmeKvPhysicalKey physical_key{};
-    const std::string chunk_suffix = key + ":" + std::to_string(chunk_index);
-    const std::string seed0 = "chunk:0:" + chunk_suffix;
-    const std::string seed1 = "chunk:1:" + chunk_suffix;
-    const uint64_t h0 = XXH64(seed0.data(), seed0.size(), 0);
-    const uint64_t h1 = XXH64(seed1.data(), seed1.size(), 0);
+    char index_buf[16];
+    const int index_len =
+        std::snprintf(index_buf, sizeof(index_buf), "%u", chunk_index);
+    std::string buf;
+    buf.reserve(8 + key.size() + 1 + static_cast<size_t>(index_len));
+    buf.assign("chunk:0:");
+    buf.append(key);
+    buf.push_back(':');
+    buf.append(index_buf, static_cast<size_t>(index_len));
+    const uint64_t h0 = XXH64(buf.data(), buf.size(), 0);
+    buf.assign("chunk:1:");
+    buf.append(key);
+    buf.push_back(':');
+    buf.append(index_buf, static_cast<size_t>(index_len));
+    const uint64_t h1 = XXH64(buf.data(), buf.size(), 0);
     std::memcpy(physical_key.data(), &h0, sizeof(h0));
     std::memcpy(physical_key.data() + 8, &h1, sizeof(h1));
     return physical_key;

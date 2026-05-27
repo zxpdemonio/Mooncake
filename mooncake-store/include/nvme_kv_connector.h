@@ -11,6 +11,9 @@
 
 namespace mooncake {
 
+// Thin ownership wrapper around an NvmeKvCommandExecutor. Provides a stable
+// interface for the backend while allowing future per-device concerns (metrics,
+// connection recovery, request batching) without modifying the executor layer.
 class NvmeKvConnector {
    public:
     using PhysicalKey = NvmeKvCommandExecutor::PhysicalKey;

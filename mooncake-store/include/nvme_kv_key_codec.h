@@ -22,6 +22,10 @@ std::string NvmeKvPhysicalKeyToHex(const NvmeKvPhysicalKey& physical_key);
 bool ParseNvmeKvPhysicalKeyHex(std::string_view physical_key_hex,
                                NvmeKvPhysicalKey& physical_key);
 
+// General-purpose hex encoding/decoding utilities.
+std::string HexEncode(std::string_view data);
+bool HexDecode(std::string_view encoded, std::string& value);
+
 // Root objects use a hash of the logical key. Large-object chunks derive
 // independent physical keys from the logical key plus chunk index so chunks do
 // not collide with the root manifest or with each other. All 16 bytes are used;

@@ -41,6 +41,14 @@ struct NvmeKvManifestChunkRecord {
     uint32_t payload_checksum;
 };
 
+static_assert(sizeof(NvmeKvObjectHeader) == 56,
+              "NvmeKvObjectHeader must be packed for binary serialization");
+static_assert(sizeof(NvmeKvManifestMetadata) == 8,
+              "NvmeKvManifestMetadata must be packed for binary serialization");
+static_assert(
+    sizeof(NvmeKvManifestChunkRecord) == 24,
+    "NvmeKvManifestChunkRecord must be packed for binary serialization");
+
 uint32_t ComputeNvmeKvPayloadChecksum(std::string_view payload);
 uint32_t ComputeNvmeKvHeaderChecksum(const NvmeKvObjectHeader& header);
 bool ValidateNvmeKvHeader(const NvmeKvObjectHeader& header,

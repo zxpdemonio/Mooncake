@@ -80,15 +80,13 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> PersistCatalog() const;
     uint32_t EffectiveMaxValueSize() const;
     uint32_t InlinePayloadLimit() const;
-    uint32_t ChunkPayloadLimit() const;
     bool ShouldStoreInline(size_t payload_size) const;
     void MarkCorrupted(const std::string& key);
     std::vector<std::string> EnabledDeviceIds() const;
     std::shared_ptr<NvmeKvConnector> GetConnectorForDeviceId(
         const std::string& device_id) const;
     void RecordDeviceFailure(const std::string& device_id);
-    void RecordDeviceSuccess(const std::string& device_id, int64_t payload_size,
-                             bool new_key_committed);
+    void RecordDeviceSuccess(const std::string& device_id);
     void ReleaseReservation(int64_t payload_size, int64_t key_count);
 
     std::atomic<bool> initialized_{false};

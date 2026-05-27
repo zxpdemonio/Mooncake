@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <fstream>
 #include <future>
-#include <iomanip>
 #include <limits>
 #include <ranges>
 #include <sstream>
@@ -29,42 +28,13 @@ constexpr char kDefaultDeviceId[] = "default";
 constexpr uint32_t kDeviceFailureThreshold = 3;
 constexpr std::string_view kCatalogFormatPrefix = "v2";
 
-std::string EncodeCatalogField(std::string_view value) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (unsigned char ch : value) {
-        oss << std::setw(2) << static_cast<int>(ch);
-    }
-    return oss.str();
+// Use shared HexEncode/HexDecode from nvme_kv_key_codec.h
+inline std::string EncodeCatalogField(std::string_view value) {
+    return HexEncode(value);
 }
 
-bool DecodeCatalogField(std::string_view encoded, std::string& value) {
-    if (encoded.size() % 2 != 0) {
-        return false;
-    }
-    value.clear();
-    value.reserve(encoded.size() / 2);
-    const auto hex_value = [](char ch) -> int {
-        if (ch >= '0' && ch <= '9') {
-            return ch - '0';
-        }
-        if (ch >= 'a' && ch <= 'f') {
-            return ch - 'a' + 10;
-        }
-        if (ch >= 'A' && ch <= 'F') {
-            return ch - 'A' + 10;
-        }
-        return -1;
-    };
-    for (size_t i = 0; i < encoded.size(); i += 2) {
-        const int high = hex_value(encoded[i]);
-        const int low = hex_value(encoded[i + 1]);
-        if (high < 0 || low < 0) {
-            return false;
-        }
-        value.push_back(static_cast<char>((high << 4) | low));
-    }
-    return true;
+inline bool DecodeCatalogField(std::string_view encoded, std::string& value) {
+    return HexDecode(encoded, value);
 }
 
 bool IsSafeDeviceId(const std::string& device_id) {
@@ -211,6 +181,9 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::LoadCatalog() {
         if (!ParseNvmeKvPhysicalKeyHex(physical_key_hex, physical_key)) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
+        if (state_int < 0 || state_int > 2) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
         auto state = static_cast<ObjectState>(state_int);
         loaded_catalog.emplace(
             key, CatalogEntry{device_id, physical_key, payload_size, state});
@@ -331,10 +304,6 @@ uint32_t NvmeKvStorageBackend::InlinePayloadLimit() const {
     return max_value_size - sizeof(ObjectHeader);
 }
 
-uint32_t NvmeKvStorageBackend::ChunkPayloadLimit() const {
-    return InlinePayloadLimit();
-}
-
 bool NvmeKvStorageBackend::ShouldStoreInline(size_t payload_size) const {
     return payload_size <= InlinePayloadLimit();
 }
@@ -389,11 +358,7 @@ void NvmeKvStorageBackend::RecordDeviceFailure(const std::string& device_id) {
     }
 }
 
-void NvmeKvStorageBackend::RecordDeviceSuccess(const std::string& device_id,
-                                               int64_t payload_size,
-                                               bool new_key_committed) {
-    (void)payload_size;
-    (void)new_key_committed;
+void NvmeKvStorageBackend::RecordDeviceSuccess(const std::string& device_id) {
     SharedMutexLocker lock(&mutex_);
     auto it = devices_.find(device_id);
     if (it == devices_.end()) {
@@ -454,10 +419,14 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
+    // Snapshot the test predicate once to avoid data races with
+    // concurrent SetTestFailurePredicate calls.
+    const auto failure_predicate = test_failure_predicate_;
+
     int64_t batch_total_size = 0;
     int64_t batch_total_keys = 0;
     for (const auto& [key, slices] : batch_object) {
-        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+        if (failure_predicate && failure_predicate(key)) {
             continue;
         }
         if (slices.empty()) {
@@ -519,16 +488,21 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
 
+    const auto enabled_device_ids = EnabledDeviceIds();
+    if (enabled_device_ids.empty()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
     for (const auto& [key, slices] : batch_object) {
-        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+        if (failure_predicate && failure_predicate(key)) {
             continue;
         }
-        if (slices.empty()) {
+        if (key.empty() || slices.empty()) {
             continue;
         }
 
@@ -568,6 +542,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         const auto physical_key = EncodeNvmeKvPhysicalKey(key);
         const auto verify_hash = ComputeNvmeKvVerifyHash(key);
         std::string root_value;
+        std::vector<NvmeKvManifestChunkRecord> manifest_records;
         const bool store_inline = ShouldStoreInline(payload_size);
 
         if (store_inline) {
@@ -583,7 +558,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             header.header_checksum = ComputeNvmeKvHeaderChecksum(header);
             root_value = BuildNvmeKvObjectValue(header, payload_view);
         } else {
-            const uint32_t chunk_payload_limit = ChunkPayloadLimit();
+            const uint32_t chunk_payload_limit = InlinePayloadLimit();
             if (chunk_payload_limit == 0) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -596,7 +571,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
 
-            std::vector<NvmeKvManifestChunkRecord> manifest_records;
             manifest_records.reserve(chunk_count);
             for (size_t chunk_index = 0; chunk_index < chunk_count;
                  ++chunk_index) {
@@ -641,11 +615,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 BuildNvmeKvObjectValue(manifest_header, manifest_payload);
         }
 
-        const auto enabled_device_ids = EnabledDeviceIds();
-        if (enabled_device_ids.empty()) {
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-        }
-
         // Fast path: if key is already COMMITTED in catalog, skip entirely.
         {
             SharedMutexLocker lock(&mutex_, shared_lock);
@@ -676,7 +645,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 auto existing_value_res = connector->Retrieve(physical_key);
                 if (existing_value_res &&
                     existing_value_res.value() == root_value) {
-                    bool inserted_new_key = false;
                     {
                         SharedMutexLocker lock(&mutex_);
                         auto catalog_it = catalog_.find(key);
@@ -690,7 +658,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                             total_size_.fetch_add(
                                 static_cast<uint32_t>(payload_size),
                                 std::memory_order_relaxed);
-                            inserted_new_key = true;
                         } else if (catalog_it->second.state !=
                                    ObjectState::COMMITTED) {
                             catalog_it->second.state = ObjectState::COMMITTED;
@@ -700,11 +667,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                             catalog_it->second.device_id = device_id;
                         }
                     }
-                    RecordDeviceSuccess(device_id,
-                                        inserted_new_key
-                                            ? static_cast<int64_t>(payload_size)
-                                            : 0,
-                                        inserted_new_key);
+                    RecordDeviceSuccess(device_id);
                     keys.push_back(key);
                     metadatas.emplace_back(BuildStorageObjectMetadata(
                         key, static_cast<uint32_t>(payload_size)));
@@ -753,16 +716,10 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                     write_error = store_res.error();
                 }
             } else {
-                const uint32_t chunk_payload_limit = ChunkPayloadLimit();
-                const size_t chunk_count =
-                    (payload_size + chunk_payload_limit - 1) /
-                    chunk_payload_limit;
-                for (size_t chunk_index = 0; chunk_index < chunk_count;
-                     ++chunk_index) {
-                    const size_t offset = chunk_index * chunk_payload_limit;
-                    const size_t chunk_size =
-                        std::min(static_cast<size_t>(chunk_payload_limit),
-                                 payload_size - offset);
+                const uint32_t chunk_payload_limit = InlinePayloadLimit();
+                for (size_t ci = 0; ci < manifest_records.size(); ++ci) {
+                    const size_t offset = ci * chunk_payload_limit;
+                    const size_t chunk_size = manifest_records[ci].payload_size;
                     std::string_view chunk_payload(payload_view.data() + offset,
                                                    chunk_size);
                     ObjectHeader chunk_header{
@@ -773,16 +730,16 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                         .payload_size = static_cast<uint32_t>(chunk_size),
                         .verify_hash = verify_hash,
                         .payload_checksum =
-                            ComputeNvmeKvPayloadChecksum(chunk_payload),
+                            manifest_records[ci].payload_checksum,
                         .header_checksum = 0,
                     };
                     chunk_header.header_checksum =
                         ComputeNvmeKvHeaderChecksum(chunk_header);
                     auto chunk_value =
                         BuildNvmeKvObjectValue(chunk_header, chunk_payload);
-                    auto chunk_res = connector->Store(
-                        EncodeNvmeKvChunkPhysicalKey(key, chunk_index),
-                        std::move(chunk_value));
+                    auto chunk_res =
+                        connector->Store(manifest_records[ci].physical_key,
+                                         std::move(chunk_value));
                     if (!chunk_res) {
                         write_success = false;
                         write_error = chunk_res.error();
@@ -810,6 +767,10 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 }
                 RecordDeviceFailure(device_id);
                 if (retry_count + 1 == enabled_device_ids.size()) {
+                    // Persist any keys committed earlier in this batch.
+                    if (!keys.empty()) {
+                        PersistCatalog();
+                    }
                     return tl::make_unexpected(write_error);
                 }
                 continue;
@@ -822,8 +783,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 total_size_.fetch_add(static_cast<uint32_t>(payload_size),
                                       std::memory_order_relaxed);
             }
-            RecordDeviceSuccess(device_id, static_cast<int64_t>(payload_size),
-                                true);
+            RecordDeviceSuccess(device_id);
 
             keys.push_back(key);
             metadatas.emplace_back(BuildStorageObjectMetadata(
@@ -832,8 +792,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             break;
         }
 
-        remaining_reserved_size -= static_cast<int64_t>(payload_size);
-        remaining_reserved_keys -= 1;
         if (!key_committed) {
             continue;
         }
