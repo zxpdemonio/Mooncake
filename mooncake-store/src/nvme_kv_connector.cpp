@@ -8,6 +8,13 @@ NvmeKvConnector::NvmeKvConnector(
     std::string device_id, std::unique_ptr<NvmeKvCommandExecutor> executor)
     : device_id_(std::move(device_id)), executor_(std::move(executor)) {}
 
+tl::expected<void, ErrorCode> NvmeKvConnector::Flush() {
+    if (executor_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return executor_->Flush();
+}
+
 tl::expected<void, ErrorCode> NvmeKvConnector::Store(const PhysicalKey& key,
                                                      std::string value) {
     if (executor_ == nullptr) {
@@ -38,6 +45,22 @@ tl::expected<bool, ErrorCode> NvmeKvConnector::Exists(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     return executor_->Exists(key);
+}
+
+tl::expected<void, ErrorCode> NvmeKvConnector::Delete(const PhysicalKey& key) {
+    if (executor_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return executor_->Delete(key);
+}
+
+tl::expected<std::vector<NvmeKvConnector::PhysicalKey>, ErrorCode>
+NvmeKvConnector::List(const PhysicalKey& prefix, uint8_t prefix_len,
+                      uint32_t max_keys) const {
+    if (executor_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return executor_->List(prefix, prefix_len, max_keys);
 }
 
 const NvmeKvConnector::Capabilities& NvmeKvConnector::GetCapabilities() const {

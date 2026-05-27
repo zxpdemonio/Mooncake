@@ -31,24 +31,32 @@ constexpr uint32_t kConservativeValueSizeFallback = 128 * 1024;
 constexpr uint32_t kNvmeIoctlTimeoutMs = 30000;
 constexpr uint32_t kMooncakePhysicalKeySize = 16;
 constexpr uint32_t kNvmeIdentifyDataSize = 4096;
-constexpr uint32_t kNvmeKvValueBlockBytes = 512;
-constexpr int kNvmeKvStatusKeyNotFound = 0x4087;
+// Default KVCG fallback (dword = 4 bytes per NVMe KV spec).
+// Actual value should come from Capabilities.kvcg probed at init time.
+constexpr uint32_t kDefaultKvcgBytes = 4;
+// NVMe KV command-specific status codes (SC field, SCT=0).
+// The ioctl passthrough returns the full 15-bit status word from the CQE:
+//   [14]=DNR [13]=More [12:11]=CRD [10:8]=SCT [7:0]=SC
+// We mask to (SCT << 8 | SC) for matching, ignoring DNR/More/CRD bits.
+constexpr uint32_t kNvmeStatusMask = 0x7FFu;          // SCT[2:0] + SC[7:0]
+constexpr uint32_t kNvmeScKvKeyNotExists = 0x087u;    // SCT=0, SC=0x87
+constexpr uint32_t kNvmeScKvKeyExists = 0x089u;       // SCT=0, SC=0x89
+constexpr uint32_t kNvmeScInvalidValueSize = 0x085u;  // SCT=0, SC=0x85
+constexpr uint32_t kNvmeScInvalidKeySize = 0x086u;    // SCT=0, SC=0x86
+constexpr uint32_t kNvmeScCapExceeded = 0x081u;       // SCT=0, SC=0x81
 constexpr size_t kNvmeDmaAlignment = 4096;
 
 // NVMe command-set constants used by the Linux passthrough ioctl path.
 constexpr uint8_t kNvmeAdminIdentifyOpcode = 0x06;
 constexpr uint8_t kNvmeIdentifyCsiNamespace = 0x05;
+constexpr uint8_t kNvmeKvFlushOpcode = 0x00;
 constexpr uint8_t kNvmeKvStoreOpcode = 0x01;
 constexpr uint8_t kNvmeKvRetrieveOpcode = 0x02;
+constexpr uint8_t kNvmeKvListOpcode = 0x06;
+constexpr uint8_t kNvmeKvDeleteOpcode = 0x10;
 constexpr uint8_t kNvmeKvExistOpcode = 0x14;
 constexpr uint8_t kNvmeKvCommandSetIndicator = 0x01;
 constexpr uint32_t kCdw11KeyLengthMask = 0xFFu;
-constexpr uint32_t kCdw14PayloadMask = 0x00FFFFFFu;
-
-uint32_t SetCdw14WithCsi(uint32_t key_hi_low32) {
-    return (static_cast<uint32_t>(kNvmeKvCommandSetIndicator) << 24) |
-           (key_hi_low32 & kCdw14PayloadMask);
-}
 
 uint32_t BuildKeyLengthField(size_t key_length) {
     return static_cast<uint32_t>(key_length) & kCdw11KeyLengthMask;
@@ -81,19 +89,19 @@ AlignedUniquePtr<char> AllocateAlignedBuffer(size_t size) {
     return AlignedUniquePtr<char>(static_cast<char*>(ptr));
 }
 
-uint32_t RoundUpToKvTransferBytes(uint32_t bytes) {
+uint32_t RoundUpToKvTransferBytes(uint32_t bytes, uint32_t kvcg) {
     if (bytes == 0) {
         return 0;
     }
-    return ((bytes + kNvmeKvValueBlockBytes - 1u) / kNvmeKvValueBlockBytes) *
-           kNvmeKvValueBlockBytes;
+    return ((bytes + kvcg - 1u) / kvcg) * kvcg;
 }
 
-tl::expected<uint32_t, ErrorCode> ComputeKvBlockCountMinusOne(uint32_t bytes) {
+tl::expected<uint32_t, ErrorCode> ComputeKvBlockCountMinusOne(uint32_t bytes,
+                                                              uint32_t kvcg) {
     if (bytes == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return (bytes + kNvmeKvValueBlockBytes - 1u) / kNvmeKvValueBlockBytes - 1u;
+    return (bytes + kvcg - 1u) / kvcg - 1u;
 }
 
 bool ShouldTraceCommands() {
@@ -110,7 +118,7 @@ void EncodeKeyIntoCommand(const NvmeKvCommandExecutor::PhysicalKey& key,
     std::memcpy(key_buf, key.data(), key.size());
     cmd.cdw2 = static_cast<uint32_t>(key_buf[0]);
     cmd.cdw3 = static_cast<uint32_t>(key_buf[0] >> 32);
-    cmd.cdw14 = SetCdw14WithCsi(static_cast<uint32_t>(key_buf[1]));
+    cmd.cdw14 = static_cast<uint32_t>(key_buf[1]);
     cmd.cdw15 = static_cast<uint32_t>(key_buf[1] >> 32);
 }
 
@@ -181,55 +189,82 @@ std::optional<NvmeKvCommandExecutor::Capabilities> ParseKvIdentifyNamespace(
         return std::nullopt;
     }
 
+    // KV Format Descriptor offset +8: KVCG (Key Value Command Granularity)
+    // in bytes. 0 means device uses dword (4-byte) granularity.
+    const uint32_t kvcg_raw = ReadLe32(data.data() + format_offset + 8);
+
     NvmeKvCommandExecutor::Capabilities caps;
     caps.max_key_size = max_key_size;
     caps.max_value_size = max_value_size;
     caps.effective_max_value_size = max_value_size;
+    caps.kvcg = (kvcg_raw > 0) ? kvcg_raw : kDefaultKvcgBytes;
     caps.probed = true;
     return caps;
 }
 
-uint32_t ParseU32EnvOr(const std::string& name, uint32_t fallback) {
-    const char* value = std::getenv(name.c_str());
-    if (value == nullptr || value[0] == '\0') {
-        return fallback;
-    }
-    char* end = nullptr;
-    errno = 0;
-    unsigned long parsed = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' || parsed > UINT32_MAX) {
-        return fallback;
-    }
-    return static_cast<uint32_t>(parsed);
-}
-
 ErrorCode MapTransportError(int err, bool is_write) {
-    const uint32_t already_exists_status =
-        ParseU32EnvOr("MOONCAKE_NVME_KV_STATUS_KEY_ALREADY_EXISTS", 0);
-    const uint32_t device_full_status =
-        ParseU32EnvOr("MOONCAKE_NVME_KV_STATUS_DEVICE_FULL", 0);
-    switch (err) {
-        case ENOENT:
-        case kNvmeKvStatusKeyNotFound:
+    // Negative err = errno from system call failure.
+    if (err == ENOENT) {
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+    if (err == ENOSPC) {
+        return ErrorCode::KEYS_ULTRA_LIMIT;
+    }
+    if (err == EINVAL) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (err == ENOMEM) {
+        return ErrorCode::BUFFER_OVERFLOW;
+    }
+
+    // Positive err = NVMe CQE status word from ioctl passthrough.
+    // Match on SCT+SC (lower 11 bits), ignoring DNR/More/CRD.
+    const uint32_t nvme_status = static_cast<uint32_t>(err) & kNvmeStatusMask;
+    switch (nvme_status) {
+        case kNvmeScKvKeyNotExists:
             return ErrorCode::OBJECT_NOT_FOUND;
-        case ENOSPC:
-            return ErrorCode::KEYS_ULTRA_LIMIT;
-        case EINVAL:
+        case kNvmeScKvKeyExists:
+            return ErrorCode::OBJECT_ALREADY_EXISTS;
+        case kNvmeScInvalidValueSize:
+        case kNvmeScInvalidKeySize:
             return ErrorCode::INVALID_PARAMS;
-        case ENOMEM:
-            return ErrorCode::BUFFER_OVERFLOW;
+        case kNvmeScCapExceeded:
+            return ErrorCode::KEYS_ULTRA_LIMIT;
         default:
-            if (already_exists_status != 0 &&
-                static_cast<uint32_t>(err) == already_exists_status) {
-                return ErrorCode::OBJECT_ALREADY_EXISTS;
-            }
-            if (device_full_status != 0 &&
-                static_cast<uint32_t>(err) == device_full_status) {
-                return ErrorCode::KEYS_ULTRA_LIMIT;
-            }
             return is_write ? ErrorCode::FILE_WRITE_FAIL
                             : ErrorCode::FILE_READ_FAIL;
     }
+}
+
+// Parse the device-returned List buffer into a vector of PhysicalKeys.
+// Buffer layout per NVMe KV spec:
+//   Bytes 0-3: uint32_t num_keys (LE)
+//   Bytes 4-7: reserved
+//   For each key:
+//     Bytes 0-1: uint16_t key_length (LE)
+//     Bytes 2-(2+key_length-1): key_data
+std::vector<NvmeKvCommandExecutor::PhysicalKey> ParseListBuffer(
+    const uint8_t* buf, uint32_t buf_size) {
+    std::vector<NvmeKvCommandExecutor::PhysicalKey> keys;
+    if (buf_size < 8) {
+        return keys;
+    }
+    const uint32_t num_keys = ReadLe32(buf);
+    keys.reserve(std::min(num_keys, static_cast<uint32_t>(4096)));
+    size_t offset = 8;
+    for (uint32_t i = 0; i < num_keys && offset + 2 <= buf_size; ++i) {
+        const uint16_t key_len = ReadLe16(buf + offset);
+        offset += 2;
+        if (key_len != sizeof(NvmeKvCommandExecutor::PhysicalKey) ||
+            offset + key_len > buf_size) {
+            break;
+        }
+        NvmeKvCommandExecutor::PhysicalKey key{};
+        std::memcpy(key.data(), buf + offset, key_len);
+        offset += key_len;
+        keys.push_back(key);
+    }
+    return keys;
 }
 
 class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
@@ -301,6 +336,20 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         }
     }
 
+    tl::expected<void, ErrorCode> Flush() override {
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = kNvmeKvFlushOpcode;
+        cmd.nsid = nsid_;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+
+        const PhysicalKey dummy_key{};
+        auto result = Submit(cmd, true, "flush", dummy_key);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+        return {};
+    }
+
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
                                         std::string value) override {
         if (value.empty() ||
@@ -309,7 +358,9 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         }
 
         const uint32_t value_size = static_cast<uint32_t>(value.size());
-        const uint32_t transfer_bytes = RoundUpToKvTransferBytes(value_size);
+        const uint32_t kvcg = capabilities_.kvcg;
+        const uint32_t transfer_bytes =
+            RoundUpToKvTransferBytes(value_size, kvcg);
         auto dma_buffer = AllocateAlignedBuffer(transfer_bytes);
         if (dma_buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -324,7 +375,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.data_len = transfer_bytes;
         cmd.cdw10 = value_size;
         cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count = ComputeKvBlockCountMinusOne(value_size);
+        auto block_count = ComputeKvBlockCountMinusOne(value_size, kvcg);
         if (!block_count) {
             return tl::make_unexpected(block_count.error());
         }
@@ -387,6 +438,70 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         return true;
     }
 
+    tl::expected<void, ErrorCode> Delete(const PhysicalKey& key) override {
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = kNvmeKvDeleteOpcode;
+        cmd.nsid = nsid_;
+        cmd.cdw10 = 0;
+        cmd.cdw11 = BuildKeyLengthField(key.size());
+        cmd.cdw12 = 0;
+        cmd.cdw13 = 0;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+        EncodeKeyIntoCommand(key, cmd);
+
+        auto result = Submit(cmd, true, "delete", key);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+        return {};
+    }
+
+    tl::expected<std::vector<PhysicalKey>, ErrorCode> List(
+        const PhysicalKey& prefix, uint8_t prefix_len,
+        uint32_t max_keys) const override {
+        // Buffer layout: 4-byte num_keys + 4-byte reserved + entries
+        // Each entry: 2-byte key_length + key_data
+        const uint32_t kvcg = capabilities_.kvcg;
+        const uint32_t entry_size =
+            static_cast<uint32_t>(sizeof(uint16_t) + sizeof(PhysicalKey));
+        const uint64_t raw_buf_size =
+            8ull + static_cast<uint64_t>(max_keys) * entry_size;
+        if (raw_buf_size > UINT32_MAX) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const uint32_t buf_size =
+            RoundUpToKvTransferBytes(static_cast<uint32_t>(raw_buf_size), kvcg);
+        auto dma_buffer = AllocateAlignedBuffer(buf_size);
+        if (dma_buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        std::memset(dma_buffer.get(), 0, buf_size);
+
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = kNvmeKvListOpcode;
+        cmd.nsid = nsid_;
+        cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
+        cmd.data_len = buf_size;
+        cmd.cdw10 = buf_size;
+        cmd.cdw11 = BuildKeyLengthField(prefix_len);
+        auto block_count = ComputeKvBlockCountMinusOne(buf_size, kvcg);
+        if (!block_count) {
+            return tl::make_unexpected(block_count.error());
+        }
+        cmd.cdw12 = block_count.value();
+        cmd.cdw13 = 0;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+        EncodeKeyIntoCommand(prefix, cmd);
+
+        auto result = Submit(cmd, false, "list", prefix);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+
+        return ParseListBuffer(
+            reinterpret_cast<const uint8_t*>(dma_buffer.get()), buf_size);
+    }
+
     const Capabilities& GetCapabilities() const override {
         return capabilities_;
     }
@@ -398,8 +513,9 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<RawResult, ErrorCode> RawRetrieve(const PhysicalKey& key,
                                                    const char* op_name) const {
-        auto dma_buffer =
-            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
+        const uint32_t max_size = capabilities_.effective_max_value_size;
+        const uint32_t kvcg = capabilities_.kvcg;
+        auto dma_buffer = AllocateAlignedBuffer(max_size);
         if (dma_buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -407,11 +523,10 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         cmd.opcode = kNvmeKvRetrieveOpcode;
         cmd.nsid = nsid_;
         cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
-        cmd.data_len = capabilities_.effective_max_value_size;
-        cmd.cdw10 = capabilities_.effective_max_value_size;
+        cmd.data_len = max_size;
+        cmd.cdw10 = max_size;
         cmd.cdw11 = BuildKeyLengthField(key.size());
-        auto block_count =
-            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
+        auto block_count = ComputeKvBlockCountMinusOne(max_size, kvcg);
         if (!block_count) {
             return tl::make_unexpected(block_count.error());
         }
@@ -476,6 +591,7 @@ std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvIoctlExecutor(
     fallback_caps.max_key_size = kMooncakePhysicalKeySize;
     fallback_caps.max_value_size = fallback_limit;
     fallback_caps.effective_max_value_size = fallback_limit;
+    fallback_caps.kvcg = kDefaultKvcgBytes;
 
     auto executor = std::make_unique<NvmeKvIoctlExecutor>(
         std::move(device_path), nsid, fallback_caps);

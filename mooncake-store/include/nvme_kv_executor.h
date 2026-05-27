@@ -5,6 +5,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -20,10 +21,18 @@ class NvmeKvCommandExecutor {
         uint32_t max_key_size = 16;
         uint32_t max_value_size = UINT32_MAX;
         uint32_t effective_max_value_size = UINT32_MAX;
+        // Key Value Command Granularity: the minimum transfer unit (bytes)
+        // used for CDW12 (transfer unit count minus one). Probed from Identify
+        // Namespace KV format descriptor; defaults to 4 (dword) per spec.
+        uint32_t kvcg = 4;
         bool probed = false;
     };
 
     virtual ~NvmeKvCommandExecutor() = default;
+
+    // Flush volatile write cache to non-volatile media.
+    // Ensures all prior Store commands are durable on power loss.
+    virtual tl::expected<void, ErrorCode> Flush() = 0;
 
     virtual tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
                                                 std::string value) = 0;
@@ -46,8 +55,26 @@ class NvmeKvCommandExecutor {
     }
     virtual tl::expected<bool, ErrorCode> Exists(
         const PhysicalKey& key) const = 0;
+
+    // Delete a key from the device.
+    // Returns: void on success, OBJECT_NOT_FOUND if key doesn't exist,
+    // or other ErrorCode on device failure.
+    virtual tl::expected<void, ErrorCode> Delete(const PhysicalKey& key) = 0;
+
+    // List keys on the device matching a prefix.
+    // prefix_len=0 means list all keys. Returns up to max_keys results.
+    // When more keys exist than fit in the buffer, returns a partial result;
+    // the caller should invoke again with the last key as the new prefix.
+    virtual tl::expected<std::vector<PhysicalKey>, ErrorCode> List(
+        const PhysicalKey& prefix, uint8_t prefix_len,
+        uint32_t max_keys = 1024) const = 0;
+
     virtual const Capabilities& GetCapabilities() const = 0;
     virtual std::string GetBackendType() const = 0;
+
+    // TODO: Reservation commands (Register 0x0D, Report 0x0E, Acquire 0x11,
+    // Release 0x15) are not needed under current single-node-per-device
+    // architecture. Add if multi-initiator access is introduced.
 };
 
 std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvIoctlExecutor(
