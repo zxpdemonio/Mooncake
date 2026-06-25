@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pytest
 
+import mooncake.structured_object_store as structured_object_store
 from mooncake.structured_object_store import (
     BundleTransferPolicy,
     MooncakeBundleTransfer,
@@ -384,6 +385,8 @@ def test_get_object_requires_get_tensor_for_tensor_payload() -> None:
 
 def test_put_object_torch_tensor_raw_fallback_roundtrip() -> None:
     torch = pytest.importorskip("torch")
+    if not callable(getattr(structured_object_store._mooncake_store, "_serialize_tensor", None)):
+        pytest.skip("mooncake.store tensor serialization helpers are not available")
     store, transfer = make_transfer(NoTensorFastPathStore())
     tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     scalar_tensor = torch.tensor(1.5, dtype=torch.float32)
