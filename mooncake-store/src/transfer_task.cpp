@@ -1051,15 +1051,21 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE: {
-                    auto [prepared, staging] = ensureRegisteredForRDMA(slices);
-                    if (prepared.empty() && !slices.empty()) {
-                        LOG(ERROR) << "ensureRegisteredForRDMA failed";
-                        return std::nullopt;
-                    }
-                    future = submitTransferEngineOperation(handle, prepared,
-                                                           op_code);
-                    if (future && !staging.empty()) {
-                        future->attachStagingHandles(std::move(staging));
+                    if (engine_.hasRdmaTransport()) {
+                        auto [prepared, staging] =
+                            ensureRegisteredForRDMA(slices);
+                        if (prepared.empty() && !slices.empty()) {
+                            LOG(ERROR) << "ensureRegisteredForRDMA failed";
+                            return std::nullopt;
+                        }
+                        future = submitTransferEngineOperation(handle, prepared,
+                                                               op_code);
+                        if (future && !staging.empty()) {
+                            future->attachStagingHandles(std::move(staging));
+                        }
+                    } else {
+                        future = submitTransferEngineOperation(handle, slices,
+                                                               op_code);
                     }
                     break;
                 }
@@ -1116,7 +1122,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         // For WRITE ops, ensure slices are in RDMA-registered memory.
         const std::vector<Slice>* effective_slices = &slices;
         std::vector<Slice> prepared;
-        if (op_code == TransferRequest::WRITE) {
+        if (op_code == TransferRequest::WRITE && engine_.hasRdmaTransport()) {
             auto [p, staging] = ensureRegisteredForRDMA(slices);
             if (p.empty() && !slices.empty()) {
                 LOG(ERROR) << "ensureRegisteredForRDMA failed in submit_batch";
