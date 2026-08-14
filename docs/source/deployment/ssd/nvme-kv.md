@@ -47,6 +47,22 @@ flowchart TD
 
 The master selects the real client that owns a `LOCAL_DISK` replica. Only that real client opens the local NVMe KV device and issues device commands.
 
+## Device Attachment
+
+Mooncake configures the NVMe KV backend through the Linux device node that is
+visible to the real client process. The namespace may be attached directly to
+the node as a local NVMe device, or it may be discovered through NVMe-oF by the
+operating system. In both cases, Mooncake treats the namespace as one
+`LOCAL_DISK` backend owned by that real client.
+
+This path is separate from Mooncake's SPDK-based NVMe-oF SSD pool. The SSD pool
+uses offset-addressed namespaces registered with the Mooncake master, while the
+NVMe KV backend submits KV Store, Retrieve, and Delete commands to one
+configured KV namespace. Mooncake does not manage the NVMe-oF discovery session
+for the KV namespace; configure the namespace first, then point
+`MOONCAKE_NVME_KV_DEVICE_PATH` at the resulting `/dev/nvme*` block device or
+the matching `/dev/ng*` generic character device.
+
 ## Configuration
 
 Set the NVMe KV variables in the real client environment. They are not required by the master.
