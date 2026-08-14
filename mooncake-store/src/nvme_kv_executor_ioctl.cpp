@@ -171,6 +171,58 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         return {};
     }
 
+    tl::expected<void, ErrorCode> Iterate(
+        const std::function<tl::expected<void, ErrorCode>(
+            const PhysicalKey &key)> &visitor) const override {
+        constexpr uint32_t kListBufferBytes = 4096;
+        auto dma_buffer = AllocateNvmeKvAlignedBuffer(kListBufferBytes);
+        if (dma_buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        PhysicalKey cursor_key{};
+        bool has_cursor = false;
+        for (uint32_t iteration = 0; iteration < NvmeKvListMaxIterations();
+             ++iteration) {
+            std::memset(dma_buffer.get(), 0, kListBufferBytes);
+            nvme_passthru_cmd cmd{};
+            BuildNvmeKvListCommand(cmd, nsid_,
+                                   has_cursor ? &cursor_key : nullptr,
+                                   dma_buffer.get(), kListBufferBytes);
+            auto result = Submit(cmd, false, "list");
+            if (!result) {
+                return tl::make_unexpected(result.error());
+            }
+            auto keys =
+                ParseNvmeKvListResponse(dma_buffer.get(), kListBufferBytes);
+            if (!keys) {
+                return tl::make_unexpected(keys.error());
+            }
+            if (keys->empty()) {
+                return {};
+            }
+            PhysicalKey last_key{};
+            bool made_progress = false;
+            for (const auto &key : *keys) {
+                if (has_cursor && !(cursor_key < key)) {
+                    continue;
+                }
+                auto visit = visitor(key);
+                if (!visit) {
+                    return visit;
+                }
+                last_key = key;
+                made_progress = true;
+            }
+            if (!made_progress) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            cursor_key = last_key;
+            has_cursor = true;
+        }
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     const Capabilities &GetCapabilities() const override {
         return capabilities_;
     }
@@ -217,6 +269,7 @@ NvmeKvExecutorResult CreateNvmeKvIoctlExecutor(
     uint32_t runtime_transfer_limit) {
     auto caps = BuildNvmeKvCapabilities(kDefaultNvmeKvQueueDepth, queue_depth,
                                         runtime_transfer_limit);
+    caps.supports_iterate = true;
 
     auto executor = std::make_unique<NvmeKvIoctlExecutor>(
         std::move(device_path), nsid, caps);

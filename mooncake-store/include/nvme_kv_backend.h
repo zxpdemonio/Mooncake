@@ -84,6 +84,7 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
     mutable std::shared_mutex manifest_cache_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const CachedManifest>>
         manifest_cache_;
+    mutable std::shared_mutex scanmeta_mutex_;
     std::shared_ptr<NvmeKvConnector> connector_;
     std::atomic<int64_t> total_size_{0};
     std::atomic<int64_t> total_keys_{0};

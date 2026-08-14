@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -169,6 +170,133 @@ struct ResolvedRoot {
     uint32_t slot = 0;
     std::string object_blob;
 };
+
+struct RebuiltObjectMetadata {
+    std::string key;
+    uint32_t slot = 0;
+    StorageObjectMetadata metadata;
+};
+
+tl::expected<std::optional<RebuiltObjectMetadata>, ErrorCode>
+RebuildMetadataFromPhysicalKey(NvmeKvConnector &connector,
+                               const NvmeKvPhysicalKey &physical_key,
+                               uint32_t effective_max_value_size) {
+    NvmeKvCommandExecutor::RetrieveBufferRequest prefix_request;
+    prefix_request.key = physical_key;
+    prefix_request.size_hint = sizeof(NvmeKvObjectHeader);
+    prefix_request.allow_size_retry = false;
+    std::vector<NvmeKvCommandExecutor::RetrieveBufferRequest> prefix_requests;
+    prefix_requests.push_back(std::move(prefix_request));
+    connector.RetrieveBufferBatch(prefix_requests);
+    if (!prefix_requests.front().result) {
+        if (prefix_requests.front().result.error() ==
+            ErrorCode::OBJECT_NOT_FOUND) {
+            return std::nullopt;
+        }
+        return tl::make_unexpected(prefix_requests.front().result.error());
+    }
+
+    const auto &prefix = prefix_requests.front().result.value();
+    const uint32_t object_size =
+        ResolveNvmeKvObjectBlobSizeFromPrefix(prefix.data, prefix.size);
+    if (object_size == 0) {
+        return std::nullopt;
+    }
+    // ScanMeta sees every physical key. A raw chunk may start with bytes that
+    // look like an object header, so ignore prefixes that cannot be a bounded
+    // root object instead of failing the whole rebuild.
+    if (object_size > effective_max_value_size) {
+        return std::nullopt;
+    }
+
+    std::string object_blob;
+    if (object_size <= prefix.size) {
+        object_blob.assign(prefix.data, prefix.data + object_size);
+    } else {
+        auto object_res = connector.Retrieve(physical_key, object_size);
+        if (!object_res) {
+            return std::nullopt;
+        }
+        object_blob = std::move(object_res.value());
+    }
+
+    NvmeKvObjectHeader header{};
+    std::string_view identity_metadata_view;
+    std::string_view payload_view;
+    if (!ParseNvmeKvObjectBlob(object_blob, header, identity_metadata_view,
+                               payload_view)) {
+        return std::nullopt;
+    }
+
+    NvmeKvStoredIdentityView stored_identity_view{};
+    if (!ParseNvmeKvStoredIdentity(identity_metadata_view,
+                                   stored_identity_view) ||
+        stored_identity_view.logical_key.empty()) {
+        return std::nullopt;
+    }
+    NvmeKvObjectIdentity identity{.logical_key =
+                                      stored_identity_view.logical_key};
+    if (!NvmeKvKeyConflictPolicy::ValidateResolvedRootPlacement(
+            identity, stored_identity_view, physical_key)) {
+        return std::nullopt;
+    }
+
+    const uint32_t expected_identity_size =
+        ComputeNvmeKvStoredIdentityMetadataSize(identity);
+    uint32_t logical_payload_size = 0;
+    const auto object_type = static_cast<NvmeKvObjectType>(header.object_type);
+    if (object_type == NvmeKvObjectType::kInline) {
+        if (!ValidateNvmeKvHeader(header, identity, expected_identity_size,
+                                  static_cast<uint32_t>(payload_view.size()),
+                                  NvmeKvObjectType::kInline) ||
+            header.payload_checksum !=
+                ComputeNvmeKvPayloadChecksum(payload_view)) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        logical_payload_size = static_cast<uint32_t>(payload_view.size());
+    } else if (object_type == NvmeKvObjectType::kManifest) {
+        if (!ValidateNvmeKvHeader(header, identity, expected_identity_size,
+                                  static_cast<uint32_t>(payload_view.size()),
+                                  NvmeKvObjectType::kManifest) ||
+            header.payload_checksum !=
+                ComputeNvmeKvPayloadChecksum(payload_view)) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        NvmeKvManifestMetadata metadata{};
+        std::vector<NvmeKvManifestChunkRecord> chunk_records;
+        if (!ParseNvmeKvManifest(payload_view, metadata, chunk_records) ||
+            metadata.chunk_count != chunk_records.size()) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        auto chunk_offsets =
+            ValidateChunkRecords(identity, stored_identity_view.resolved_slot,
+                                 metadata.logical_payload_size, chunk_records);
+        if (!chunk_offsets) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        for (const auto &record : chunk_records) {
+            if (ResolveNvmeKvStoreSubmissionBytes(record.payload_size) >
+                effective_max_value_size) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+        }
+        logical_payload_size = metadata.logical_payload_size;
+    } else {
+        return std::nullopt;
+    }
+
+    return RebuiltObjectMetadata{
+        .key = stored_identity_view.logical_key,
+        .slot = stored_identity_view.resolved_slot,
+        .metadata = StorageObjectMetadata{
+            .bucket_id = 0,
+            .offset = 0,
+            .key_size =
+                static_cast<int64_t>(stored_identity_view.logical_key.size()),
+            .data_size = static_cast<int64_t>(logical_payload_size),
+            .transport_endpoint = "",
+        }};
+}
 
 tl::expected<std::optional<ResolvedRoot>, ErrorCode> ResolveRoot(
     NvmeKvConnector &connector, const std::string &logical_key) {
@@ -536,6 +664,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
     if (batch_object.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
+    std::shared_lock<std::shared_mutex> scan_lock(scanmeta_mutex_);
 
     struct OffloadPlan {
         std::string key;
@@ -1567,7 +1696,84 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::ScanMeta(
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    (void)handler;
+    auto connector = connector_;
+    if (connector == nullptr) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (!connector->GetCapabilities().supports_iterate) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::unique_lock<std::shared_mutex> scan_lock(scanmeta_mutex_);
+
+    const uint32_t effective_max_value_size =
+        std::max(connector->GetCapabilities().effective_max_value_size,
+                 kMinMaxValueSize);
+    const size_t batch_limit =
+        std::max<int64_t>(1, file_storage_config_.scanmeta_iterator_keys_limit);
+    std::vector<std::string> batch_keys;
+    std::vector<StorageObjectMetadata> batch_metadatas;
+    batch_keys.reserve(batch_limit);
+    batch_metadatas.reserve(batch_limit);
+    int64_t scanned_size = 0;
+    int64_t scanned_keys = 0;
+
+    const auto flush_batch = [&]() -> ErrorCode {
+        if (batch_keys.empty()) {
+            return ErrorCode::OK;
+        }
+        ErrorCode err = ErrorCode::OK;
+        if (handler != nullptr) {
+            err = handler(batch_keys, batch_metadatas);
+        }
+        batch_keys.clear();
+        batch_metadatas.clear();
+        return err;
+    };
+
+    auto iterate_res = connector->Iterate(
+        [&](const PhysicalKey &physical_key) -> tl::expected<void, ErrorCode> {
+            auto metadata_res = RebuildMetadataFromPhysicalKey(
+                *connector, physical_key, effective_max_value_size);
+            if (!metadata_res) {
+                return tl::make_unexpected(metadata_res.error());
+            }
+            if (!metadata_res.value()) {
+                return {};
+            }
+            auto rebuilt_meta = std::move(metadata_res.value().value());
+            auto resolved = ResolveRoot(*connector, rebuilt_meta.key);
+            if (!resolved) {
+                return tl::make_unexpected(resolved.error());
+            }
+            if (!resolved.value() ||
+                resolved.value()->physical_key != physical_key ||
+                resolved.value()->slot != rebuilt_meta.slot) {
+                return {};
+            }
+
+            scanned_size += rebuilt_meta.metadata.data_size;
+            ++scanned_keys;
+            batch_keys.push_back(rebuilt_meta.key);
+            batch_metadatas.push_back(rebuilt_meta.metadata);
+            if (batch_keys.size() >= batch_limit) {
+                const auto err = flush_batch();
+                if (err != ErrorCode::OK) {
+                    return tl::make_unexpected(err);
+                }
+            }
+            return {};
+        });
+    if (!iterate_res) {
+        return tl::make_unexpected(iterate_res.error());
+    }
+
+    const auto err = flush_batch();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    total_keys_.store(scanned_keys, std::memory_order_relaxed);
+    total_size_.store(scanned_size, std::memory_order_relaxed);
     return {};
 }
 

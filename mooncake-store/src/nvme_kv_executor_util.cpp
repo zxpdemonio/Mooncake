@@ -20,6 +20,10 @@ constexpr uint32_t kNvmeKvStatusKeyNotFound = 0x87;
 constexpr uint32_t kNvmeKvStatusUnrecoveredRead = 0x88;
 constexpr uint32_t kNvmeKvStatusKeyExists = 0x89;
 
+uint16_t ReadLe16(const uint8_t *p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
 uint32_t ReadLe32(const uint8_t *p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) |
@@ -202,6 +206,53 @@ ErrorCode MapNvmeKvTransportError(int err, bool is_write) {
         default:
             return MapNvmeKvStatus(static_cast<uint32_t>(err), is_write);
     }
+}
+
+tl::expected<std::vector<NvmeKvCommandExecutor::PhysicalKey>, ErrorCode>
+ParseNvmeKvListResponse(const char *buffer, uint32_t buffer_size) {
+    if (buffer_size < sizeof(uint32_t)) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    const auto *bytes = reinterpret_cast<const uint8_t *>(buffer);
+    const uint32_t returned_keys = ReadLe32(bytes);
+    const uint32_t max_possible_keys =
+        (buffer_size - sizeof(uint32_t)) / sizeof(uint32_t);
+    if (returned_keys > max_possible_keys) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::vector<NvmeKvCommandExecutor::PhysicalKey> keys;
+    keys.reserve(returned_keys);
+
+    uint32_t offset = sizeof(uint32_t);
+    for (uint32_t i = 0; i < returned_keys; ++i) {
+        if (offset + sizeof(uint16_t) > buffer_size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        const uint16_t key_length = ReadLe16(bytes + offset);
+        offset += sizeof(uint16_t);
+        if (key_length != NvmeKvCommandExecutor::PhysicalKey{}.size()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (offset + key_length > buffer_size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        NvmeKvCommandExecutor::PhysicalKey key{};
+        std::memcpy(key.data(), buffer + offset, key_length);
+        keys.push_back(key);
+        offset += key_length;
+        offset = (offset + 3u) & ~3u;
+        if (offset > buffer_size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+    return keys;
+}
+
+uint32_t NvmeKvListMaxIterations() {
+    return ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_LIST_MAX_ITERATIONS",
+                               1u << 20);
 }
 
 bool IsNvmeKvControlFlowError(ErrorCode error) {

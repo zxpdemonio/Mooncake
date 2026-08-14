@@ -44,7 +44,7 @@ bool CanSubmitCallerBufferDirectly(std::string_view value,
 }
 
 bool IsCharacterDevice(const std::filesystem::path& path) {
-    struct stat st{};
+    struct stat st {};
     return ::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode);
 }
 
@@ -72,7 +72,7 @@ std::string ResolveIoUringDevicePath(const std::string& device_path) {
 class SharedNvmeUringRing {
    public:
     struct BatchCommand {
-        struct nvme_uring_cmd cmd{};
+        struct nvme_uring_cmd cmd {};
         bool is_write = false;
         size_t context_index = 0;
         uint32_t observed_result = 0;
@@ -598,12 +598,25 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
                     return;
                 }
 
+                if (!request.allow_size_retry && request.size_hint != 0) {
+                    char* data = attempt.dma_buffer.get();
+                    std::shared_ptr<void> owner(attempt.dma_buffer.release(),
+                                                NvmeKvFreeDeleter());
+                    request.result = RetrievedBuffer{
+                        .owner = std::move(owner),
+                        .data = data,
+                        .size = prefix_limit,
+                    };
+                    return;
+                }
+
                 uint32_t required_size = attempt.returned_size;
                 if (required_size <= prefix_limit) {
                     required_size = ResolveNvmeKvObjectBlobSizeFromPrefix(
                         attempt.dma_buffer.get(), prefix_limit);
                 }
-                if (allow_retry && required_size > prefix_limit &&
+                if (allow_retry && request.allow_size_retry &&
+                    required_size > prefix_limit &&
                     required_size <= capabilities_.effective_max_value_size) {
                     retry_attempts.push_back(
                         make_attempt(attempt.request_index, required_size));
@@ -635,7 +648,8 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
             const uint32_t initial_bytes =
                 initial_request_bytes[attempt.request_index];
             if (attempt.error != ErrorCode::OK) {
-                if (ShouldRetryNvmeKvRetrieveWithMaxBuffer(
+                if (request.allow_size_retry &&
+                    ShouldRetryNvmeKvRetrieveWithMaxBuffer(
                         attempt.error, request.size_hint, initial_bytes,
                         capabilities_.effective_max_value_size)) {
                     fallback_attempts.push_back(
@@ -743,6 +757,66 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
         return {};
     }
 
+    tl::expected<void, ErrorCode> Iterate(
+        const std::function<tl::expected<void, ErrorCode>(
+            const PhysicalKey& key)>& visitor) const override {
+        constexpr uint32_t kListBufferBytes = 4096;
+        auto dma_buffer = AllocateNvmeKvAlignedBuffer(kListBufferBytes);
+        if (dma_buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        PhysicalKey cursor_key{};
+        bool has_cursor = false;
+        for (uint32_t iteration = 0; iteration < NvmeKvListMaxIterations();
+             ++iteration) {
+            std::memset(dma_buffer.get(), 0, kListBufferBytes);
+            SharedNvmeUringRing::BatchCommand command;
+            BuildNvmeKvListCommand(command.cmd, nsid_,
+                                   has_cursor ? &cursor_key : nullptr,
+                                   dma_buffer.get(), kListBufferBytes);
+            command.is_write = false;
+            std::vector<SharedNvmeUringRing::BatchCommand> commands;
+            commands.push_back(command);
+            auto& ring =
+                SharedNvmeUringRing::Instance(capabilities_.queue_depth);
+            auto result = ring.SubmitBatch(fd_, commands);
+            if (!result) {
+                return tl::make_unexpected(result.error());
+            }
+            if (commands.front().mapped_error != ErrorCode::OK) {
+                return tl::make_unexpected(commands.front().mapped_error);
+            }
+            auto keys =
+                ParseNvmeKvListResponse(dma_buffer.get(), kListBufferBytes);
+            if (!keys) {
+                return tl::make_unexpected(keys.error());
+            }
+            if (keys->empty()) {
+                return {};
+            }
+            PhysicalKey last_key{};
+            bool made_progress = false;
+            for (const auto& key : *keys) {
+                if (has_cursor && !(cursor_key < key)) {
+                    continue;
+                }
+                auto visit = visitor(key);
+                if (!visit) {
+                    return visit;
+                }
+                last_key = key;
+                made_progress = true;
+            }
+            if (!made_progress) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            cursor_key = last_key;
+            has_cursor = true;
+        }
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     const Capabilities& GetCapabilities() const override {
         return capabilities_;
     }
@@ -765,6 +839,7 @@ NvmeKvExecutorResult CreateNvmeKvIoUringExecutor(
     uint32_t runtime_transfer_limit) {
     auto caps = BuildNvmeKvCapabilities(kDefaultNvmeKvQueueDepth, queue_depth,
                                         runtime_transfer_limit);
+    caps.supports_iterate = true;
 
     auto executor = std::make_unique<NvmeKvIoUringExecutor>(
         std::move(device_path), nsid, caps);

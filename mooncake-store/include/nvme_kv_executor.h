@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -41,6 +42,7 @@ class NvmeKvCommandExecutor {
     struct RetrieveBufferRequest {
         PhysicalKey key;
         uint32_t size_hint = 0;
+        bool allow_size_retry = true;
         tl::expected<RetrievedBuffer, ErrorCode> result =
             tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     };
@@ -56,6 +58,7 @@ class NvmeKvCommandExecutor {
     struct Capabilities {
         uint32_t effective_max_value_size = UINT32_MAX;
         uint32_t queue_depth = 1;
+        bool supports_iterate = false;
     };
 
     virtual ~NvmeKvCommandExecutor() = default;
@@ -85,6 +88,9 @@ class NvmeKvCommandExecutor {
             buffer.owner = owner;
             buffer.data = owner->data();
             buffer.size = static_cast<uint32_t>(owner->size());
+            if (!request.allow_size_retry && request.size_hint != 0) {
+                buffer.size = std::min(buffer.size, request.size_hint);
+            }
             request.result = std::move(buffer);
         }
     }
@@ -118,6 +124,12 @@ class NvmeKvCommandExecutor {
         }
     }
     virtual tl::expected<void, ErrorCode> Delete(const PhysicalKey &key) = 0;
+    virtual tl::expected<void, ErrorCode> Iterate(
+        const std::function<tl::expected<void, ErrorCode>(
+            const PhysicalKey &key)> &visitor) const {
+        (void)visitor;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     virtual const Capabilities &GetCapabilities() const = 0;
 };
 

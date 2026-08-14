@@ -199,6 +199,15 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Delete(const PhysicalKey &key) {
     return executor_->Delete(key);
 }
 
+tl::expected<void, ErrorCode> NvmeKvConnector::Iterate(
+    const std::function<tl::expected<void, ErrorCode>(const PhysicalKey &key)>
+        &visitor) const {
+    if (executor_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return executor_->Iterate(visitor);
+}
+
 const NvmeKvConnector::Capabilities &NvmeKvConnector::GetCapabilities() const {
     static const Capabilities kDefaultCapabilities{};
     return executor_ == nullptr ? kDefaultCapabilities

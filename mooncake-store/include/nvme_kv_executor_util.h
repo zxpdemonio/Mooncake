@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "nvme_kv_executor.h"
 #include "types.h"
@@ -29,6 +30,7 @@ constexpr uint8_t kNvmeKvCommandSetIdentifier = 0x01;
 constexpr uint8_t kNvmeKvStoreOpcode = 0x01;
 constexpr uint8_t kNvmeKvRetrieveOpcode = 0x02;
 constexpr uint8_t kNvmeKvDeleteOpcode = 0x10;
+constexpr uint8_t kNvmeKvListOpcode = 0x06;
 
 struct NvmeKvFreeDeleter {
     void operator()(void *ptr) const { std::free(ptr); }
@@ -62,6 +64,9 @@ NvmeKvPackedKeyFields PackNvmeKvPhysicalKey(
 ErrorCode MapNvmeKvStatus(uint32_t status, bool is_write);
 ErrorCode MapNvmeKvTransportError(int err, bool is_write);
 bool IsNvmeKvControlFlowError(ErrorCode error);
+tl::expected<std::vector<NvmeKvCommandExecutor::PhysicalKey>, ErrorCode>
+ParseNvmeKvListResponse(const char *buffer, uint32_t buffer_size);
+uint32_t NvmeKvListMaxIterations();
 
 inline uint32_t BuildNvmeKvKeyLengthField(size_t key_length) {
     return static_cast<uint32_t>(key_length) & 0xFFu;
@@ -108,6 +113,26 @@ void BuildNvmeKvRetrieveCommand(Command &cmd, uint32_t nsid,
     cmd.cdw12 = ComputeNvmeKvValueBlockCountMinusOne(transfer_bytes);
     cmd.timeout_ms = kNvmeKvCommandTimeoutMs;
     EncodeNvmeKvKey(key, cmd);
+}
+
+template <typename Command>
+void BuildNvmeKvListCommand(Command &cmd, uint32_t nsid,
+                            const NvmeKvCommandExecutor::PhysicalKey *cursor,
+                            void *data, uint32_t transfer_bytes) {
+    cmd = {};
+    cmd.opcode = kNvmeKvListOpcode;
+    cmd.nsid = nsid;
+    cmd.addr = reinterpret_cast<uint64_t>(data);
+    cmd.data_len = transfer_bytes;
+    cmd.cdw10 = transfer_bytes;
+    cmd.cdw11 =
+        BuildNvmeKvKeyLengthField(cursor == nullptr ? 0 : cursor->size());
+    cmd.timeout_ms = kNvmeKvCommandTimeoutMs;
+    if (cursor != nullptr) {
+        EncodeNvmeKvKey(*cursor, cmd);
+    } else {
+        cmd.cdw14 = static_cast<uint32_t>(kNvmeKvCommandSetIdentifier) << 24;
+    }
 }
 
 template <typename Command>

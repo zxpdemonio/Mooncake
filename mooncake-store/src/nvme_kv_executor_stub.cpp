@@ -2,6 +2,7 @@
 #include "nvme_kv_executor_util.h"
 
 #include <filesystem>
+#include <exception>
 #include <fstream>
 #include <system_error>
 #include <utility>
@@ -18,7 +19,9 @@ class NvmeKvStubExecutor : public NvmeKvCommandExecutor {
           capabilities_(BuildNvmeKvCapabilities(
               1, ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_QUEUE_DEPTH", 1),
               ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
-                                  128 * 1024))) {}
+                                  128 * 1024))) {
+        capabilities_.supports_iterate = true;
+    }
 
     tl::expected<void, ErrorCode> Store(const PhysicalKey &key,
                                         std::string value) override {
@@ -84,6 +87,43 @@ class NvmeKvStubExecutor : public NvmeKvCommandExecutor {
         }
         if (!removed) {
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return {};
+    }
+
+    tl::expected<void, ErrorCode> Iterate(
+        const std::function<tl::expected<void, ErrorCode>(
+            const PhysicalKey &key)> &visitor) const override {
+        std::error_code ec;
+        if (!std::filesystem::exists(storage_path_, ec)) {
+            return {};
+        }
+        for (const auto &entry :
+             std::filesystem::directory_iterator(storage_path_, ec)) {
+            if (ec) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (!entry.is_regular_file() ||
+                entry.path().extension() != ".blob") {
+                continue;
+            }
+            const auto stem = entry.path().stem().string();
+            if (stem.size() != 32) {
+                continue;
+            }
+            PhysicalKey key{};
+            try {
+                for (size_t i = 0; i < key.size(); ++i) {
+                    key[i] = static_cast<uint8_t>(
+                        std::stoul(stem.substr(i * 2, 2), nullptr, 16));
+                }
+            } catch (const std::exception &) {
+                continue;
+            }
+            auto result = visitor(key);
+            if (!result) {
+                return result;
+            }
         }
         return {};
     }

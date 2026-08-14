@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,9 @@ class NvmeKvConnector {
         std::vector<NvmeKvCommandExecutor::RetrieveIntoRequest> &requests)
         const;
     tl::expected<void, ErrorCode> Delete(const PhysicalKey &key);
+    tl::expected<void, ErrorCode> Iterate(
+        const std::function<tl::expected<void, ErrorCode>(
+            const PhysicalKey &key)> &visitor) const;
     const Capabilities &GetCapabilities() const;
 
    private:
