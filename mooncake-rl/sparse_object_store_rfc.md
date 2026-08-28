@@ -399,6 +399,7 @@ produce one source object, two unique TP-range GETs, and no complete source COO 
 
 ## AI assistance disclosure
 
-This RFC contains AI-assisted editing and validation. The Mooncake and RL framework maintainers
-still need to confirm the business semantics, module ownership, and acceptance criteria during
-RFC review.
+The research, analysis, and technical design in this RFC were completed by the RFC author. AI
+tools were used only to assist with wording, formatting, and validation. The Mooncake and RL
+framework maintainers still need to confirm the business semantics, module ownership, and
+acceptance criteria during RFC review.
