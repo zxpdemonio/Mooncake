@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900" viewBox="0 0 1800 900">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title { font: 700 24px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #0f172a; }
+      .subtitle { font: 15px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #475569; }
+      .lane-title { font: 700 18px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #0f172a; }
+      .node-title { font: 700 16px "Alibaba PuHuiTi", "PingFang SC", sans-serif; }
+      .node-text { font: 15px "Alibaba PuHuiTi", "PingFang SC", sans-serif; }
+      .edge-label { font: 14px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #334155; }
+      .note-title { font: 700 14px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #78350f; }
+      .note-text { font: 14px "Alibaba PuHuiTi", "PingFang SC", sans-serif; fill: #78350f; }
+      .edge { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1800" height="900" fill="#ffffff"/>
+  <text x="40" y="42" class="title">RL Framework × Mooncake Sparse Weight Transfer</text>
+  <text x="42" y="72" class="subtitle">Core path: complete global COO → structured object → Mooncake sparse-aware reshard → target-local COO</text>
+
+  <rect x="40" y="110" width="420" height="620" fill="#f8fbff" stroke="#93c5fd"/>
+  <rect x="40" y="110" width="420" height="38" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="52" y="136" class="lane-title">RL Framework / Training Side</text>
+  <rect x="500" y="110" width="800" height="620" fill="#f7fef9" stroke="#86efac"/>
+  <rect x="500" y="110" width="800" height="38" fill="#f0fdf4" stroke="#86efac"/>
+  <text x="512" y="136" class="lane-title">Mooncake Sparse Object Store</text>
+  <rect x="1340" y="110" width="420" height="620" fill="#f8fbff" stroke="#93c5fd"/>
+  <rect x="1340" y="110" width="420" height="38" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="1352" y="136" class="lane-title">RL Framework / Inference Side</text>
+
+  <rect x="80" y="200" width="340" height="135" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="94" y="228" class="node-title" fill="#172554">Training weights</text>
+  <text x="94" y="253" class="node-text" fill="#172554">W_current / snapshot</text>
+  <text x="94" y="278" class="node-text" fill="#172554">Complete weight except EP</text>
+  <text x="94" y="303" class="node-text" fill="#172554">EP owner computes full expert delta</text>
+
+  <rect x="80" y="395" width="340" height="135" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="94" y="423" class="node-title" fill="#172554">RL framework adapter</text>
+  <text x="94" y="448" class="node-text" fill="#172554">delta = current − snapshot</text>
+  <text x="94" y="473" class="node-text" fill="#172554">threshold / coalesce → global COO</text>
+  <text x="94" y="498" class="node-text" fill="#172554">descriptor, placement, generation</text>
+
+  <rect x="80" y="585" width="340" height="90" fill="#fef3c7" stroke="#d97706" stroke-dasharray="8 6"/>
+  <text x="94" y="613" class="note-title">RL framework does not implement</text>
+  <text x="94" y="638" class="note-text">TP split, COO overlap/filter/rebase</text>
+  <text x="94" y="660" class="note-text">range GET, cache, fan-out, Store-key orchestration</text>
+
+  <rect x="540" y="200" width="340" height="155" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+  <text x="554" y="228" class="node-title" fill="#3b0764">Control plane: Manifest / Placement</text>
+  <text x="554" y="253" class="node-text" fill="#3b0764">canonical source owner</text>
+  <text x="554" y="278" class="node-text" fill="#3b0764">EP owner / non-EP replicate</text>
+  <text x="554" y="303" class="node-text" fill="#3b0764">generation fence + object ref</text>
+  <text x="554" y="328" class="node-text" fill="#3b0764">idempotent logical-key commit</text>
+
+  <rect x="920" y="200" width="340" height="155" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="934" y="228" class="node-title" fill="#14532d">Data plane: COO structured object</text>
+  <text x="934" y="253" class="node-text" fill="#14532d">JSON metadata + named buffers</text>
+  <text x="934" y="278" class="node-text" fill="#14532d">indices / values</text>
+  <text x="934" y="303" class="node-text" fill="#14532d">tile_coords / tile_ptr</text>
+  <text x="934" y="328" class="node-text" fill="#14532d">copy mode accepted; zero-copy not required</text>
+
+  <rect x="660" y="425" width="480" height="175" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="678" y="453" class="node-title" fill="#14532d">Sparse-aware reshard core</text>
+  <text x="678" y="480" class="node-text" fill="#14532d">1. intersect target box with source tiles</text>
+  <text x="678" y="507" class="node-text" fill="#14532d">2. coalesce unique indices/values ranges</text>
+  <text x="678" y="534" class="node-text" fill="#14532d">3. boundary filter + target-local rebase</text>
+  <text x="678" y="561" class="node-text" fill="#14532d">4. target object, node-local cache, fan-out</text>
+
+  <rect x="660" y="635" width="480" height="70" fill="#fef3c7" stroke="#d97706" stroke-dasharray="8 6"/>
+  <text x="678" y="662" class="note-title">No redundant transfer</text>
+  <text x="678" y="687" class="note-text">non-EP: one source object; same node: one GET per range</text>
+
+  <rect x="1380" y="200" width="340" height="145" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="1394" y="228" class="node-title" fill="#172554">Target EP×TP / EP-only</text>
+  <text x="1394" y="253" class="node-text" fill="#172554">receive target-local structured object</text>
+  <text x="1394" y="278" class="node-text" fill="#172554">read indices / values</text>
+  <text x="1394" y="303" class="node-text" fill="#172554">no full-source filtering</text>
+  <rect x="1380" y="425" width="340" height="135" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="1394" y="453" class="node-title" fill="#172554">Local weight update</text>
+  <text x="1394" y="480" class="node-text" fill="#172554">scatter_add(target-local COO)</text>
+  <text x="1394" y="507" class="node-text" fill="#172554">W_new = W_old + delta</text>
+  <text x="1394" y="534" class="node-text" fill="#172554">EP expert consumes owner data only</text>
+
+  <path d="M250 335 V395" class="edge"/>
+  <path d="M420 440 H480 V278 H540" class="edge"/>
+  <path d="M420 490 H500 V380 H890 V278 H920" class="edge"/>
+  <path d="M880 278 H920" class="edge"/>
+  <path d="M710 355 V425" class="edge"/>
+  <path d="M1090 355 V390 H900 V425" class="edge"/>
+  <path d="M1140 512 H1380" class="edge"/>
+  <path d="M1550 345 V425" class="edge"/>
+
+  <rect x="40" y="770" width="1720" height="75" fill="#fef3c7" stroke="#d97706" stroke-dasharray="8 6"/>
+  <text x="56" y="797" class="note-title">Coordinate convention</text>
+  <text x="56" y="823" class="note-text">source stores global COO; TP appears only in the target box; Mooncake creates target-local COO during materialization.</text>
+</svg>

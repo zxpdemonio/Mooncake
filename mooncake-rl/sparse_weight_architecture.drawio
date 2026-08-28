@@ -1,0 +1,69 @@
+<mxfile host="app.diagrams.net" version="24.7.17">
+  <diagram id="sparse-weight-architecture" name="Architecture">
+    <mxGraphModel dx="1800" dy="1000" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="1800" pageHeight="1000">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="RL Framework × Mooncake Sparse Weight Transfer" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=24;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="25" width="1000" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="Core path: complete global COO → structured object → Mooncake sparse-aware reshard → target-local COO" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=15;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="42" y="65" width="1300" height="30" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="lane_training" value="RL Framework / Training Side" style="swimlane;horizontal=1;startSize=38;rounded=0;html=1;fillColor=#F8FBFF;strokeColor=#93C5FD;fontColor=#0F172A;fontSize=18;fontStyle=1;spacingLeft=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="420" height="620" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane_mc" value="Mooncake Sparse Object Store" style="swimlane;horizontal=1;startSize=38;rounded=0;html=1;fillColor=#F7FEF9;strokeColor=#86EFAC;fontColor=#0F172A;fontSize=18;fontStyle=1;spacingLeft=12;" vertex="1" parent="1">
+          <mxGeometry x="500" y="120" width="800" height="620" as="geometry"/>
+        </mxCell>
+        <mxCell id="lane_runtime" value="RL Framework / Inference Side" style="swimlane;horizontal=1;startSize=38;rounded=0;html=1;fillColor=#F8FBFF;strokeColor=#93C5FD;fontColor=#0F172A;fontSize=18;fontStyle=1;spacingLeft=12;" vertex="1" parent="1">
+          <mxGeometry x="1340" y="120" width="420" height="620" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="r_train" value="&lt;b&gt;Training weights&lt;/b&gt;&lt;br&gt;W_current / snapshot&lt;br&gt;Complete weight except EP&lt;br&gt;EP owner computes full expert delta" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#172554;fontSize=16;spacing=8;" vertex="1" parent="lane_training">
+          <mxGeometry x="40" y="90" width="340" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="r_adapter" value="&lt;b&gt;RL framework adapter&lt;/b&gt;&lt;br&gt;delta = current − snapshot&lt;br&gt;threshold / coalesce → global COO&lt;br&gt;provides descriptor, placement, generation" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#172554;fontSize=16;spacing=8;" vertex="1" parent="lane_training">
+          <mxGeometry x="40" y="285" width="340" height="135" as="geometry"/>
+        </mxCell>
+        <mxCell id="r_note" value="RL framework does not implement: TP split, COO overlap/filter/rebase, range GET, cache, fan-out, Store-key orchestration" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=14;spacing=8;" vertex="1" parent="lane_training">
+          <mxGeometry x="40" y="475" width="340" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="m_control" value="&lt;b&gt;Control plane: Manifest / Placement&lt;/b&gt;&lt;br&gt;canonical source owner&lt;br&gt;EP owner / non-EP replicate&lt;br&gt;generation fence + object ref&lt;br&gt;idempotent logical-key commit" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#3B0764;fontSize=16;spacing=8;" vertex="1" parent="lane_mc">
+          <mxGeometry x="40" y="90" width="340" height="155" as="geometry"/>
+        </mxCell>
+        <mxCell id="m_backend" value="&lt;b&gt;Data plane: COO structured object&lt;/b&gt;&lt;br&gt;JSON metadata + named buffers&lt;br&gt;indices / values&lt;br&gt;tile_coords / tile_ptr&lt;br&gt;copy mode accepted; zero-copy not required" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontColor=#14532D;fontSize=16;spacing=8;" vertex="1" parent="lane_mc">
+          <mxGeometry x="420" y="90" width="340" height="155" as="geometry"/>
+        </mxCell>
+        <mxCell id="m_planner" value="&lt;b&gt;Sparse-aware reshard core&lt;/b&gt;&lt;br&gt;1. intersect target box with source tiles&lt;br&gt;2. coalesce unique indices/values ranges&lt;br&gt;3. boundary filter + target-local rebase&lt;br&gt;4. target object, node-local cache, fan-out" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontColor=#14532D;fontSize=16;spacing=8;" vertex="1" parent="lane_mc">
+          <mxGeometry x="160" y="315" width="480" height="175" as="geometry"/>
+        </mxCell>
+        <mxCell id="m_guard" value="&lt;b&gt;No redundant transfer&lt;/b&gt;&lt;br&gt;non-EP: one source object&lt;br&gt;same node: one GET per range, fan out to targets&lt;br&gt;cross-node: only the necessary replica hop" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=14;spacing=8;" vertex="1" parent="lane_mc">
+          <mxGeometry x="160" y="525" width="480" height="90" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="i_runtime" value="&lt;b&gt;Target EP×TP / EP-only&lt;/b&gt;&lt;br&gt;receive target-local structured object&lt;br&gt;read indices / values&lt;br&gt;no full-source filtering" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#172554;fontSize=16;spacing=8;" vertex="1" parent="lane_runtime">
+          <mxGeometry x="40" y="90" width="340" height="145" as="geometry"/>
+        </mxCell>
+        <mxCell id="i_apply" value="&lt;b&gt;Local weight update&lt;/b&gt;&lt;br&gt;scatter_add(target-local COO)&lt;br&gt;W_new = W_old + delta&lt;br&gt;EP expert consumes owner data only" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontColor=#172554;fontSize=16;spacing=8;" vertex="1" parent="lane_runtime">
+          <mxGeometry x="40" y="315" width="340" height="135" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e_train" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="r_train" target="r_adapter"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_admission" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="r_adapter" target="m_control"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_put" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="r_adapter" target="m_backend"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_plan" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="m_control" target="m_planner"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_data" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="m_backend" target="m_planner"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_target" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="m_planner" target="i_runtime"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_apply" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;endArrow=block;endFill=1;fontSize=14;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="i_runtime" target="i_apply"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="footer" value="Coordinate convention: source stores global COO; TP appears only in the target box; Mooncake creates target-local COO during materialization." style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=15;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="40" y="790" width="1720" height="80" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
