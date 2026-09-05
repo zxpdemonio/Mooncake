@@ -5318,9 +5318,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                     }
                 }
+                // A query granted before this write lock can retain its
+                // descriptor for a full read TTL. Keep the old allocation for
+                // at least that long as well as the writer grace period.
                 const auto release_at =
-                    std::max(metadata.lease_timeout,
-                             now + put_start_release_timeout_sec_);
+                    now +
+                    std::max(
+                        std::chrono::milliseconds(default_kv_lease_ttl_),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            put_start_release_timeout_sec_));
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {

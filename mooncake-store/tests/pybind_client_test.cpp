@@ -571,7 +571,7 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     PyClient::QueryResultCache snapshot;
     snapshot.emplace(key, std::move(queries[0]));
     auto destination = py_client_->allocate_client_buffer(original.size());
-    ASSERT_NE(destination, nullptr);
+    ASSERT_TRUE(destination.has_value());
     auto read = [&](size_t offset, size_t size) {
         return py_client_->get_into_ranges_from_snapshot(
             {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
@@ -606,23 +606,23 @@ TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
                  std::vector<Replica::Descriptor>(queries[0]->replicas),
                  std::chrono::steady_clock::now() - std::chrono::seconds(1)));
     auto destination = py_client_->allocate_client_buffer(data.size());
-    ASSERT_NE(destination, nullptr);
+    ASSERT_TRUE(destination.has_value());
     auto read = [&]() {
         return py_client_->get_into_ranges_from_snapshot(
             {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
     };
     EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
-                          {{to_py_ret(ErrorCode::LEASE_EXPIRED)}}}));
+                          {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
     // The existing cache API still allows refresh for independent reads.
     EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
                                           {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
               (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
     snapshot.clear();
     EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
-                          {{to_py_ret(ErrorCode::INVALID_PARAMS)}}}));
+                          {{toInt(ErrorCode::INVALID_PARAMS)}}}));
     snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
     EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
-                          {{to_py_ret(ErrorCode::OBJECT_NOT_FOUND)}}}));
+                          {{toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
 }
 
 // Test Get Operation will fail if the lease has expired.
