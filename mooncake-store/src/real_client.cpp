@@ -3460,7 +3460,8 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
-    const std::string &key, const QueryResultCache *query_result_cache) {
+    const std::string &key, const QueryResultCache *query_result_cache,
+    bool allow_query_refresh) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3473,6 +3474,14 @@ RealClient::resolve_ranged_read_metadata(
             return build_ranged_read_metadata_from_query_result(key,
                                                                 cached->second);
         }
+        if (!allow_query_refresh) {
+            return tl::unexpected(cached == query_result_cache->end()
+                                      ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::LEASE_EXPIRED);
+        }
+    }
+    if (!allow_query_refresh) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
@@ -3784,7 +3793,7 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    const QueryResultCache *query_result_cache) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
     auto results = build_ranged_read_internal_error_results(
         buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
@@ -3818,7 +3827,8 @@ RealClient::get_into_ranges_internal(
         auto found = metadata_cache.find(key);
         if (found != metadata_cache.end()) return found->second;
         return metadata_cache
-            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache,
+                                                       allow_query_refresh))
             .first->second;
     };
 
@@ -3864,6 +3874,24 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 if (client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    if (!allow_query_refresh) {
+                        for (size_t k = 0; k < range_results.size(); ++k) {
+                            if (dst_offsets[k] > capacities[i] ||
+                                sizes[k] > capacities[i] - dst_offsets[k]) {
+                                continue;
+                            }
+                            if (metadata.query_result.IsLeaseExpired()) {
+                                range_results[k] =
+                                    tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                                continue;
+                            }
+                            range_results[k] = execute_ranged_read(
+                                keys[j], buffers[i], dst_offsets[k],
+                                src_offsets[k], sizes[k], metadata, false,
+                                false);
+                        }
+                        continue;
+                    }
                     // Planning cache entries may be close to expiry. Renew and
                     // reselect the replica before copying into device memory.
                     auto refresh_result = resolve_ranged_read_metadata(keys[j]);
@@ -3955,6 +3983,10 @@ RealClient::get_into_ranges_internal(
                 range_results[k] = execute_ranged_read(
                     keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
                     metadata, false, false);
+                if (!allow_query_refresh && range_results[k] &&
+                    metadata.query_result.IsLeaseExpired()) {
+                    range_results[k] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                }
             }
         }
     }
@@ -3990,7 +4022,7 @@ RealClient::get_into_ranges_internal(
     };
 
     // Planning may consume most of a short lease; renew before submission.
-    if (!scatter_leases.empty()) refresh_leases();
+    if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
     auto operation = client_->SubmitScatter(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -4003,7 +4035,9 @@ RealClient::get_into_ranges_internal(
     }
 
     while (true) {
-        const auto delay = next_refresh_delay();
+        const auto delay = allow_query_refresh
+                               ? next_refresh_delay()
+                               : std::chrono::nanoseconds::max();
         const auto status = delay == std::chrono::nanoseconds::max()
                                 ? operation->wait()
                                 : operation->waitFor(delay);
@@ -4011,6 +4045,19 @@ RealClient::get_into_ranges_internal(
         refresh_leases();
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+RealClient::get_into_ranges_from_snapshot(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const QueryResultCache &query_result_cache) {
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
+        &query_result_cache, false));
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(

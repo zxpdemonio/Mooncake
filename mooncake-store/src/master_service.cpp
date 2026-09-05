@@ -4936,8 +4936,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 //
 // Three-way dispatch depending on key state:
 //   Case A: key does not exist  → allocate new buffers (same as PutStart)
-//   Case B: key exists, same size → in-place update (reuse existing buffers)
-//   Case C: key exists, different size → discard old + allocate new
+//   Case B: key exists, same size, no readers → in-place update
+//   Case C: key exists, different size or leased memory → allocate new buffers
 //
 // Before reaching Case B/C the function runs safety checks and may preempt
 // an in-progress Put/Upsert on the same key.  Preempted PROCESSING replicas
@@ -5209,14 +5209,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
 
                 if (metadata.size == slice_length) {
-                    // --- Case B: same size — in-place update ---
-                    // Reuse existing buffer addresses.  No allocation or
-                    // deallocation. The client will RDMA-write new data to the
-                    // same addresses.
-                    //
-                    // hard_pinned is const and preserved automatically — upsert
-                    // does not change the eviction protection level of an
-                    // existing object.
+                    // Validate same-size DFS topology before changing storage.
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
                     if (config.dfs_replica_num > 0 ||
@@ -5243,7 +5236,19 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 ErrorCode::INVALID_PARAMS);
                         }
                     }
+                }
 
+                const bool has_read_lease = !metadata.IsLeaseExpired(now);
+                if (has_read_lease &&
+                    metadata.HasReplica([](const Replica& replica) {
+                        return !replica.is_memory_replica();
+                    })) {
+                    // File-backed reads can resolve storage by key, so they
+                    // cannot retain an old version across replacement.
+                    return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                }
+
+                if (metadata.size == slice_length && !has_read_lease) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -5277,8 +5282,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size — discard old replicas and
-                // reallocate
+                // --- Case C: different size or active readers — reallocate
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
@@ -5314,14 +5318,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                     }
                 }
+                const auto release_at =
+                    std::max(metadata.lease_timeout,
+                             now + put_start_release_timeout_sec_);
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
-                    discarded_replicas_.emplace_back(
-                        std::move(old_replicas),
-                        now + put_start_release_timeout_sec_);
+                    discarded_replicas_.emplace_back(std::move(old_replicas),
+                                                     release_at);
                 }
                 EraseMetadata(tenant_state, it, object_id.tenant_id,
                               QuotaEraseMode::kPreserveOld, &shard);

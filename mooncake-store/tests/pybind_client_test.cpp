@@ -559,6 +559,72 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
+TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_upsert";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_NE(destination, nullptr);
+    auto read = [&](size_t offset, size_t size) {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
+            {{{size}}}, snapshot);
+    };
+
+    // Pause between prefix and payload, then replace the same-size object.
+    EXPECT_EQ(read(0, 4),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    EXPECT_EQ(read(4, 28),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
+              original);
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_expired";
+    const std::string data(32, 'A');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(data)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(
+        key, QueryResult(
+                 std::vector<Replica::Descriptor>(queries[0]->replicas),
+                 std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    auto destination = py_client_->allocate_client_buffer(data.size());
+    ASSERT_NE(destination, nullptr);
+    auto read = [&]() {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+    };
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{to_py_ret(ErrorCode::LEASE_EXPIRED)}}}));
+    // The existing cache API still allows refresh for independent reads.
+    EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
+                                          {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    snapshot.clear();
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{to_py_ret(ErrorCode::INVALID_PARAMS)}}}));
+    snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{to_py_ret(ErrorCode::OBJECT_NOT_FOUND)}}}));
+}
+
 // Test Get Operation will fail if the lease has expired.
 // Set the lease time to 1ms and use large data size to ensure the lease will
 // expire.

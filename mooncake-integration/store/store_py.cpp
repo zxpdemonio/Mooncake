@@ -742,8 +742,10 @@ class MooncakeStorePyWrapper {
     }
 
     std::vector<std::optional<ParsedTensorMetadata>>
-    batch_get_tensor_metadata_prefixes(const std::vector<std::string> &keys,
-                                       const std::string &context) {
+    batch_get_tensor_metadata_prefixes(
+        const std::vector<std::string> &keys, const std::string &context,
+        const PyClient::QueryResultCache *snapshot = nullptr,
+        std::vector<int64_t> *errors = nullptr) {
         std::vector<std::optional<ParsedTensorMetadata>> metadata(keys.size());
         if (keys.empty()) return metadata;
 
@@ -751,6 +753,10 @@ class MooncakeStorePyWrapper {
         auto scratch = store_->allocate_client_buffer(scratch_size);
         if (!scratch) {
             LOG(ERROR) << context << ": failed to allocate metadata buffer";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE));
+            }
             return metadata;
         }
 
@@ -770,12 +776,19 @@ class MooncakeStorePyWrapper {
         std::vector<std::vector<std::vector<int64_t>>> results;
         {
             py::gil_scoped_release release_gil;
-            results =
-                store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                        all_src_offsets, all_sizes, nullptr);
+            results = snapshot ? real_client_->get_into_ranges_from_snapshot(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, *snapshot)
+                               : store_->get_into_ranges(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, nullptr);
         }
         if (results.size() != 1 || results[0].size() != keys.size()) {
             LOG(ERROR) << context << ": metadata read result size mismatch";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::INTERNAL_ERROR));
+            }
             return metadata;
         }
 
@@ -784,6 +797,12 @@ class MooncakeStorePyWrapper {
             if (results[0][i].size() != 1 ||
                 results[0][i][0] !=
                     static_cast<int64_t>(sizeof(TensorMetadata))) {
+                if (errors) {
+                    (*errors)[i] =
+                        results[0][i].size() == 1 && results[0][i][0] < 0
+                            ? results[0][i][0]
+                            : to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
                 continue;
             }
             metadata[i] = parse_tensor_metadata_from_prefix(
@@ -816,7 +835,24 @@ class MooncakeStorePyWrapper {
         }
 
         if (!use_dummy_client_) {
-            auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
+            if (keys.empty()) return results;
+            // Keep both reads on one snapshot. Re-querying between the prefix
+            // and payload can select a different version after an upsert.
+            PyClient::QueryResultCache snapshot;
+            {
+                py::gil_scoped_release release_gil;
+                auto queries = store_->batch_query(keys);
+                if (queries.size() != keys.size()) {
+                    return std::vector<int64_t>(
+                        keys.size(), to_py_ret(ErrorCode::INTERNAL_ERROR));
+                }
+                snapshot.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    snapshot.emplace(keys[i], std::move(queries[i]));
+                }
+            }
+            auto metadata = batch_get_tensor_metadata_prefixes(
+                keys, context, &snapshot, &results);
             std::vector<void *> buffers;
             std::vector<std::vector<std::string>> all_keys;
             std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
@@ -864,18 +900,22 @@ class MooncakeStorePyWrapper {
             std::vector<std::vector<std::vector<int64_t>>> range_results;
             {
                 py::gil_scoped_release release_gil;
-                range_results = store_->get_into_ranges(
+                range_results = real_client_->get_into_ranges_from_snapshot(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
-                    all_sizes, nullptr);
+                    all_sizes, snapshot);
             }
             for (size_t i = 0; i < original_indices.size(); ++i) {
                 const size_t original_index = original_indices[i];
-                if (i < range_results.size() && range_results[i].size() == 1 &&
-                    range_results[i][0].size() == 1 &&
-                    range_results[i][0][0] >= 0 &&
-                    static_cast<size_t>(range_results[i][0][0]) ==
-                        metadata[original_index]->data_bytes) {
-                    results[original_index] = range_results[i][0][0];
+                results[original_index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                if (range_results.size() != original_indices.size() ||
+                    range_results[i].size() != 1 ||
+                    range_results[i][0].size() != 1) {
+                    continue;
+                }
+                const int64_t result = range_results[i][0][0];
+                if (result < 0 || static_cast<size_t>(result) ==
+                                      metadata[original_index]->data_bytes) {
+                    results[original_index] = result;
                 }
             }
             return results;

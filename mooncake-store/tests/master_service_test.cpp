@@ -988,6 +988,11 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         }
 
         ReplicateConfig mismatched_config;
+        auto leased_upsert = service.UpsertStart(
+            context.client_id, "dfs_atomic", TenantId::Default(), 4096, config);
+        ASSERT_FALSE(leased_upsert.has_value());
+        EXPECT_EQ(leased_upsert.error(), ErrorCode::OBJECT_HAS_LEASE);
+
         mismatched_config.replica_num = 1;
         auto upsert =
             service.UpsertStart(context.client_id, "dfs_atomic",
