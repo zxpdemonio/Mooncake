@@ -5503,7 +5503,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // descriptor for a full read TTL. Keep the old allocation for
                 // at least that long as well as the writer grace period.
                 const auto release_at =
-                    now +
+                    std::chrono::system_clock::now() +
                     std::max(
                         std::chrono::milliseconds(default_kv_lease_ttl_),
                         std::chrono::duration_cast<std::chrono::milliseconds>(
