@@ -205,6 +205,9 @@ class DummyClient : public PyClient {
         size_t size = 0;
         std::unique_ptr<BufferHandle> staging;
         bool copy_back = false;
+        // Destination offsets used in the staged RPC.  External ranged reads
+        // compact sparse fragments into the local staging allocation.
+        std::vector<std::vector<size_t>> staged_dst_offsets;
     };
 
     bool is_device_buffer(void *buffer) const;
@@ -225,6 +228,9 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &sizes);
     bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
                            size_t offset = 0) const;
+    bool copy_from_staging_at(const PreparedBuffer &buffer, size_t size,
+                              size_t destination_offset,
+                              size_t source_offset) const;
 
     struct PreparedMultiBuffers {
         std::vector<PreparedBuffer> buffers;

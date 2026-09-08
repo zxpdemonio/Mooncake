@@ -122,7 +122,7 @@ class DummyClientGetBufferTest : public ::testing::Test {
 
     // Bring up the full real+dummy stack.
     // Returns true on success.
-    bool SetupStack() {
+    bool SetupStack(size_t local_buffer_size = kLocalBufSize) {
         // Enable hot cache with production-scale block size
         const char *prev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         if (prev) saved_hot_cache_env_ = std::string(prev);
@@ -148,7 +148,8 @@ class DummyClientGetBufferTest : public ::testing::Test {
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
         ipc_path_ = "@dummy_test_" + std::to_string(getpid()) + ".sock";
         if (real_client_->setup_real(
-                "localhost:17815", "P2PHANDSHAKE", kSegmentSize, kLocalBufSize,
+                "localhost:17815", "P2PHANDSHAKE", kSegmentSize,
+                local_buffer_size,
                 FLAGS_protocol, rdma_devices, master_.master_address(), nullptr,
                 ipc_path_) != 0) {
             return false;
@@ -167,7 +168,7 @@ class DummyClientGetBufferTest : public ::testing::Test {
         // Create DummyClient
         dummy_client_ = std::make_shared<DummyClient>();
         std::string rpc_addr = "127.0.0.1:" + std::to_string(rpc_port_);
-        if (dummy_client_->setup_dummy(kPoolSize, kLocalBufSize, rpc_addr,
+        if (dummy_client_->setup_dummy(kPoolSize, local_buffer_size, rpc_addr,
                                        ipc_path_) != 0) {
             return false;
         }
@@ -470,6 +471,33 @@ TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
     EXPECT_NE(dummy_client_->unregister_buffer(source.data()), 0);
     EXPECT_NE(dummy_client_->put_from(key, source.data(), 1), 0)
         << "transfers after the final unregister must be rejected";
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(DummyClientGetBufferTest,
+       ExternalHostRangedReadCompactsLargeDestinationOffset) {
+    constexpr size_t kSmallLocalBufferSize = 1 * kMB;
+    ASSERT_TRUE(SetupStack(kSmallLocalBufferSize))
+        << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_external_host_large_offset";
+    const std::string data = "0123456789";
+    PutData(key, data);
+
+    std::vector<char> destination(kSmallLocalBufferSize + 4096, '_');
+    ASSERT_EQ(dummy_client_->register_buffer(destination.data(),
+                                             destination.size()),
+              0);
+
+    const size_t offset = destination.size() - data.size();
+    const auto results = dummy_client_->get_into_ranges(
+        {destination.data()}, {{key}}, {{{offset}}}, {{{0}}}, {{{data.size()}}});
+    ASSERT_EQ(results,
+              (std::vector<std::vector<std::vector<int64_t>>>{{{10}}}));
+    EXPECT_EQ(std::string(destination.begin() + offset, destination.end()),
+              data);
+    EXPECT_EQ(destination.front(), '_');
+
     ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
 }
 
