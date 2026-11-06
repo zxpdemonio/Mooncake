@@ -5308,7 +5308,9 @@ class _MooncakePayloadTransport:
         put_from = getattr(self._store, "put_from", None)
         if not callable(put_tensor_from) and not callable(put_from):
             raise RuntimeError("put_from is unavailable")
-        metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
+        metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(
+            value, host_access=True
+        )
         total_bytes = len(metadata) + tensor_nbytes
         lease = self._buffer_pool.acquire(total_bytes)
         view = None
@@ -6301,10 +6303,18 @@ def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
     }, _TensorPayload(tensor=value)
 
 
-def _tensor_payload_parts(value: _TensorPayload) -> tuple[bytes, int, int, Any]:
+def _tensor_payload_parts(
+    value: _TensorPayload, *, host_access: bool = False
+) -> tuple[bytes, int, int, Any]:
+    tensor = value.tensor
+    if host_access and tensor.device.type != "cpu":
+        # Host memcpy/string_at cannot dereference a CUDA device address.
+        # Only copy fallbacks request this snapshot; native tensor PUT keeps
+        # the original device tensor and its existing transport path.
+        tensor = tensor.cpu()
     metadata, data_ptr, tensor_nbytes, owner = _tensor_codec_helper(
         "_serialize_tensor"
-    )(value.tensor)
+    )(tensor)
     return bytes(metadata), int(data_ptr), int(tensor_nbytes), owner
 
 
@@ -7025,7 +7035,9 @@ def _slice_tensor_metadata(
 
 
 def _tensor_payload_bytes(value: _TensorPayload) -> tuple[bytes, int]:
-    metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(value)
+    metadata, data_ptr, tensor_nbytes, _owner = _tensor_payload_parts(
+        value, host_access=True
+    )
     if tensor_nbytes == 0:
         return metadata, len(metadata)
     return metadata + ctypes.string_at(data_ptr, tensor_nbytes), len(metadata)
