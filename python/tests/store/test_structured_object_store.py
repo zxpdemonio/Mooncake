@@ -2256,18 +2256,23 @@ def test_structured_object_direct_torch_tensor_materialize_into_uses_real_store(
     destination = ctypes.create_string_buffer(total_bytes)
 
     try:
-        result = transfer.materialize_into(
-            transfer.read_spec(ref),
-            {
-                "tensor": tensor_object_buffer(
-                    ctypes.addressof(destination),
-                    total_bytes,
-                    destination,
-                    batch_size=3,
-                )
-            },
-        )
-        assert torch.equal(result.objects["tensor"], tensor)
+        destination_ptr = ctypes.addressof(destination)
+        assert store.register_buffer(destination_ptr, total_bytes) == 0
+        try:
+            result = transfer.materialize_into(
+                transfer.read_spec(ref),
+                {
+                    "tensor": tensor_object_buffer(
+                        destination_ptr,
+                        total_bytes,
+                        destination,
+                        batch_size=3,
+                    )
+                },
+            )
+            assert torch.equal(result.objects["tensor"], tensor)
+        finally:
+            assert store.unregister_buffer(destination_ptr) == 0
     finally:
         transfer.remove_bundle(ref)
 
