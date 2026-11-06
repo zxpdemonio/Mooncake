@@ -232,3 +232,108 @@ def test_scatter_fragment_requires_natural_dtype_alignment():
     fragment = torch.frombuffer(buffer, dtype=torch.int32, count=2, offset=1)
     with pytest.raises(ValueError, match="natural alignment"):
         tensor_destination(fragment, alignment=64, pre_registered=True, allocation=root)
+
+
+@pytest.mark.parametrize("flag", ["negative", "conjugate"])
+def test_direct_destination_rejects_logical_view_flags(flag):
+    root = torch.empty(
+        (2, 4), dtype=torch.int32 if flag == "negative" else torch.complex64
+    )
+    view = torch._neg_view(root) if flag == "negative" else root.conj()
+    with pytest.raises(ValueError, match="unresolved"):
+        tensor_destination(view, pre_registered=True)
+
+
+def test_direct_destination_rejects_logical_allocation_root():
+    target = aligned_tensor((2, 4))
+    with pytest.raises(ValueError, match="allocation"):
+        tensor_destination(
+            target, pre_registered=True, allocation=torch._neg_view(target)
+        )
+
+
+def test_direct_destination_detects_logical_flag_mutation():
+    root = aligned_tensor((2, 4))
+    destination = tensor_destination(root, alignment=64, pre_registered=True)
+    torch._C._set_neg(root, True)
+    try:
+        with pytest.raises(ValueError, match="changed since registration"):
+            destination.validate(
+                {
+                    "encoding": "torch_tensor",
+                    "dtype": "torch.int32",
+                    "element_size": 4,
+                    "direct_alignment": 64,
+                },
+                (2, 4),
+            )
+    finally:
+        torch._C._set_neg(root, False)
+
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
+@pytest.mark.parametrize(
+    "unsupported", ["scalar", "missing_native_codec", "negative", "conjugate", "sparse"]
+)
+def test_direct_writer_rejects_unreadable_payload_before_publishing(
+    monkeypatch, mode, unsupported
+):
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    value = (
+        torch.tensor(3, dtype=torch.int32)
+        if unsupported == "scalar"
+        else torch.arange(8, dtype=torch.int32)
+    )
+    if unsupported == "negative":
+        value = torch._neg_view(value)
+    elif unsupported == "conjugate":
+        value = value.to(torch.complex64).conj()
+    elif unsupported == "sparse":
+        value = value.to_sparse()
+    if unsupported == "missing_native_codec":
+        monkeypatch.setattr(
+            "mooncake.structured_object_store._has_tensor_codec_helpers", lambda: False
+        )
+    with pytest.raises(
+        ValueError, match="native tensor payload codec|unresolved|strided"
+    ):
+        transfer.put_structured_object(
+            StructuredObjectPayload(
+                buffers={"value": value},
+                field_schemas={
+                    "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
+                },
+            ),
+            policy=BundleTransferPolicy(copy_mode=mode),
+        )
+    assert store.objects == {}
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int16, torch.int32, torch.int64])
+@pytest.mark.parametrize("shape", [(0, 2, 4), (2, 0, 4), (2, 2, 4)])
+def test_direct_schema_empty_dimensions_and_dtypes(dtype, shape):
+    store, transfer = make_transfer(DirectStore())
+    source = torch.arange(torch.Size(shape).numel(), dtype=dtype).view(shape)
+    ref = transfer.put(
+        {"batch": {"value": source}},
+        type="dataproto",
+        policy=BundleTransferPolicy(copy_mode="copy"),
+        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
+    )
+    rows = list(range(shape[0] - 1, -1, -1))
+    count = source.numel() * source.element_size()
+    backing = torch.empty(count + 64, dtype=torch.uint8)
+    offset = -backing.data_ptr() % 64
+    target = backing[offset : offset + count].view(dtype).view(shape)
+    result = transfer.get(
+        ref,
+        type="dataproto",
+        data_cls=dict,
+        rows=rows,
+        destinations={
+            "value": tensor_destination(target, alignment=64, pre_registered=True)
+        },
+    )
+    assert result["batch"]["value"] is target
+    torch.testing.assert_close(target, source[rows])
+    assert store.get_into_ranges_calls == (1 if count else 0)

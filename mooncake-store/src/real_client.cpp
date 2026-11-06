@@ -5600,17 +5600,18 @@ RealClient::get_into_ranges_direct(
     const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
-#ifdef USE_TENT
     // Strict reads must retain the caller's destination until physical drain.
     // The Store TENT scatter timeout currently releases its logical batch
-    // first.
-    return convert_ranged_read_results(build_ranged_read_internal_error_results(
-        buffers.size(), all_keys, all_dst_offsets, ErrorCode::NOT_SUPPORTED));
-#else
+    // first. Check the active engine, not whether TENT was compiled in.
+    if (client_ && !client_->SupportsStrictDirectRead()) {
+        return convert_ranged_read_results(
+            build_ranged_read_internal_error_results(buffers.size(), all_keys,
+                                                     all_dst_offsets,
+                                                     ErrorCode::NOT_SUPPORTED));
+    }
     return convert_ranged_read_results(get_into_ranges_internal(
         buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
         nullptr, true, true));
-#endif
 }
 
 std::vector<std::vector<std::vector<int64_t>>>

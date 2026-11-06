@@ -35,6 +35,10 @@ class TensorDestination:
             raise ValueError("tensor destination must be a contiguous strided tensor")
         if self.tensor.device.type not in {"cpu", "cuda"}:
             raise ValueError("tensor destination supports CPU and CUDA memory only")
+        if self.tensor.is_neg() or self.tensor.is_conj():
+            raise ValueError(
+                "tensor destination cannot use unresolved negative or conjugate views"
+            )
         if (
             isinstance(self.alignment, bool)
             or not isinstance(self.alignment, int)
@@ -57,6 +61,8 @@ class TensorDestination:
             or allocation.layout != torch.strided
             or allocation.device != self.tensor.device
             or allocation.dtype != self.tensor.dtype
+            or allocation.is_neg()
+            or allocation.is_conj()
         ):
             raise ValueError(
                 "tensor destination allocation must be a contiguous tensor with the same device and dtype"
@@ -81,6 +87,8 @@ class TensorDestination:
                 value.device,
                 value.layout,
                 value.numel(),
+                value.is_neg(),
+                value.is_conj(),
             )
 
         return contract(self.tensor), contract(

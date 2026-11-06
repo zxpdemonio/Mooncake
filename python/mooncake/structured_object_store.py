@@ -6194,6 +6194,20 @@ def _encode_structured_fields(
                 raise ValueError(
                     "direct_alignment requires a dense torch tensor member"
                 )
+            if isinstance(encoded_value, _TensorPayload):
+                tensor = encoded_value.tensor
+                if (
+                    tensor.layout != _torch.strided
+                    or tensor.is_neg()
+                    or tensor.is_conj()
+                ):
+                    raise ValueError(
+                        "direct_alignment requires a strided tensor without unresolved view flags"
+                    )
+                if tensor.dim() == 0 or not _has_tensor_codec_helpers():
+                    raise ValueError(
+                        "direct_alignment requires the native tensor payload codec; torch_save fallback is unsupported"
+                    )
             spec["direct_alignment"] = schema.direct_alignment
         field_specs[name] = spec
         encoded_fields[name] = encoded_value

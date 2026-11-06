@@ -827,8 +827,12 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool SupportsStrictDirectRead() const {
+        return transfer_engine_ && !transfer_engine_->isUsingTent();
+    }
+
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
-        return transfer_engine_ && !transfer_engine_->isUsingTent() &&
+        return SupportsStrictDirectRead() &&
                transfer_engine_->getTransport(protocol) != nullptr;
     }
 
