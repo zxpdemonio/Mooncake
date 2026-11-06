@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
+    Iterable,
     Iterator,
     Literal,
     Mapping,
@@ -184,6 +185,7 @@ class MooncakeDataProtoRef:
 @dataclass(frozen=True)
 class _TensorPayload:
     tensor: Any
+    direct_alignment: int | None = None
 
 
 @dataclass(frozen=True)
@@ -4264,6 +4266,7 @@ class _BundleManifestStore:
                     payload_spec, payload_keys = self._put_tensor_payload(
                         payload_key,
                         value,
+                        target_chunk_bytes,
                         transfer_policy,
                         config=config,
                     )
@@ -4539,6 +4542,7 @@ class _BundleManifestStore:
         self,
         key: str,
         value: _TensorPayload | _TensorObjectBufferPayload,
+        chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
         config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
@@ -4549,6 +4553,28 @@ class _BundleManifestStore:
                 "bytes": total_bytes,
                 "chunks": [{"key": key, "bytes": total_bytes}],
             }, [key]
+        if (
+            value.direct_alignment is not None
+            and value.tensor.device.type == "cpu"
+            and transfer_policy.copy_mode != "zero_copy"
+            and value.tensor.nbytes + _tensor_metadata_size() > chunk_bytes
+        ):
+            # Reuse byte chunks without first concatenating a whole tensor.
+            # The owner retains any contiguous copy made by the native codec.
+            metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
+            data = (ctypes.c_ubyte * tensor_nbytes).from_address(data_ptr)
+            payload_spec, payload_keys = self._put_multi_buffer_payload(
+                key,
+                _MultiBufferPayload(
+                    buffers=(memoryview(metadata), memoryview(data).cast("B")),
+                    owners=(owner, data),
+                ),
+                chunk_bytes,
+                transfer_policy,
+                config=config,
+            )
+            payload_spec["metadata_bytes"] = len(metadata)
+            return payload_spec, payload_keys
         if transfer_policy.copy_mode != "copy":
             if transfer_policy.copy_mode == "zero_copy":
                 raise ValueError(
@@ -4970,7 +4996,7 @@ class _MooncakePayloadTransport:
         config: Any = None,
     ) -> list[str]:
         def fallback_to_direct_put() -> list[str]:
-            chunks = [memoryview(b"".join(group)) for group in chunk_groups]
+            chunks = (memoryview(b"".join(group)) for group in chunk_groups)
             return self._put_chunks_direct(chunk_keys, chunks, config)
 
         if transfer_policy.copy_mode == "zero_copy":
@@ -5352,7 +5378,7 @@ class _MooncakePayloadTransport:
     def _put_chunks_direct(
         self,
         chunk_keys: Sequence[str],
-        chunks: Sequence[memoryview],
+        chunks: Iterable[memoryview],
         config: Any = None,
     ) -> list[str]:
         written_keys: list[str] = []
@@ -6208,6 +6234,9 @@ def _encode_structured_fields(
                     raise ValueError(
                         "direct_alignment requires the native tensor payload codec; torch_save fallback is unsupported"
                     )
+                encoded_value = _TensorPayload(
+                    tensor=tensor, direct_alignment=schema.direct_alignment
+                )
             spec["direct_alignment"] = schema.direct_alignment
         field_specs[name] = spec
         encoded_fields[name] = encoded_value

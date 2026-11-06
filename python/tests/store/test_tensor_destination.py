@@ -337,3 +337,94 @@ def test_direct_schema_empty_dimensions_and_dtypes(dtype, shape):
     assert result["batch"]["value"] is target
     torch.testing.assert_close(target, source[rows])
     assert store.get_into_ranges_calls == (1 if count else 0)
+
+
+class BoundedPayloadStore(DirectStore):
+    """A copy buffer holds at most4096 bytes; large native tensors cannot fit."""
+
+    def put(self, key, value, config=None):
+        if '/buffer/' in key and len(value) > 4096:
+            return -600
+        return super().put(key, value, config=config)
+
+    def put_tensor(self, *args, **kwargs):
+        pytest.fail('large direct tensor used the single-object native path')
+
+    pub_tensor = put_tensor
+
+
+@pytest.mark.parametrize('mode', ['copy', 'auto'])
+@pytest.mark.parametrize('rows', [None, [2, 0, 2]])
+@pytest.mark.parametrize('chunk_bytes', [128, 257, 4096])
+@pytest.mark.parametrize('non_contiguous', [False, True])
+def test_large_direct_schema_respects_chunk_bytes(mode, rows, chunk_bytes, non_contiguous):
+    store, transfer = make_transfer(BoundedPayloadStore())
+    source = torch.arange(3 * 2 * 1024, dtype=torch.int32).view(3, 2, 1024)
+    if non_contiguous:
+        source = source.transpose(1, 2)
+    ref = transfer.put(
+        {'value': source}, type='dict', chunk_bytes=chunk_bytes,
+        policy=BundleTransferPolicy(copy_mode=mode),
+        field_schemas={'value': FieldSchema(codec='torch_tensor', direct_alignment=64)},
+    )
+    location = ref.field_index['value']
+    manifest = transfer._bundle_store.resolve_manifest(ref.stage_refs[location.stage])
+    chunks = manifest['buffers'][location.member]['chunks']
+    assert len(chunks) > 1
+    assert max(chunk['bytes'] for chunk in chunks) <= chunk_bytes
+    expected = source if rows is None else source[rows]
+    target = aligned_tensor(expected.shape)
+    result = transfer.get(ref, type='dict', rows=rows,
+        destinations={'value': tensor_destination(target, alignment=64, pre_registered=True)})
+    assert result['value'] is target
+    torch.testing.assert_close(target, expected)
+    assert store.get_tensor_calls == 0
+
+
+@pytest.mark.parametrize('mode', ['copy', 'auto'])
+def test_ordinary_tensor_keeps_single_object_storage(mode):
+    store, transfer = make_transfer(DirectStore())
+    source = torch.arange(6144, dtype=torch.int32).view(3, 2, 1024)
+    ref = transfer.put({'value': source}, type='dict', chunk_bytes=4096,
+        policy=BundleTransferPolicy(copy_mode=mode),
+        field_schemas={'value': FieldSchema(codec='torch_tensor')})
+    location = ref.field_index['value']
+    manifest = transfer._bundle_store.resolve_manifest(ref.stage_refs[location.stage])
+    assert len(manifest['buffers'][location.member]['chunks']) == 1
+    torch.testing.assert_close(transfer.get(ref, type='dict')['value'], source)
+
+
+def test_copy_chunks_are_assembled_on_demand_and_cleaned_on_failure():
+    from mooncake.structured_object_store import _MooncakePayloadTransport
+
+    events = []
+
+    class ObservedGroup:
+        def __init__(self, index, fail=False):
+            self.index, self.fail = index, fail
+
+        def __iter__(self):
+            events.append(('copy', self.index))
+            if self.fail:
+                raise MemoryError('injected next-chunk allocation failure')
+            return iter([memoryview(b'payload')])
+
+    class Store(DirectStore):
+        def put(self, key, value, config=None):
+            events.append(('put', key))
+            return super().put(key, value, config=config)
+
+    store = Store()
+    transport = _MooncakePayloadTransport(store)
+    transport.put_multi_buffer_payload_chunks(
+        ['first', 'second'], [ObservedGroup(0), ObservedGroup(1)],
+        BundleTransferPolicy(copy_mode='copy'))
+    assert events == [('copy', 0), ('put', 'first'), ('copy', 1), ('put', 'second')]
+    store.objects.clear()
+    events.clear()
+    with pytest.raises(MemoryError, match='next-chunk'):
+        transport.put_multi_buffer_payload_chunks(
+            ['first', 'second'], [ObservedGroup(0), ObservedGroup(1, fail=True)],
+            BundleTransferPolicy(copy_mode='copy'))
+    assert store.objects == {}
+    assert events == [('copy', 0), ('put', 'first'), ('copy', 1)]
