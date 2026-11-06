@@ -233,3 +233,32 @@ def test_buffer_pool_rejects_huge_size_overflow() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_default_pool_does_not_add_alignment_padding_or_overflow_registrations():
+    store = create_store()
+    registered = []
+
+    class ObservedStore:
+        def _get_pyclient_capsule(self):
+            return store._get_pyclient_capsule()
+
+        def register_buffer(self, pointer, size):
+            registered.append((pointer, size))
+            return store.register_buffer(pointer, size)
+
+        def unregister_buffer(self, pointer):
+            return store.unregister_buffer(pointer)
+
+    pool = BufferPool(ObservedStore())
+    leases = []
+    try:
+        for _ in range(4):
+            leases.append(pool.acquire(1024 * 1024))
+        assert registered == []
+        leases.append(pool.acquire(1024))
+        assert len(registered) == 1
+    finally:
+        for lease in leases:
+            lease.release()
+        pool.close()

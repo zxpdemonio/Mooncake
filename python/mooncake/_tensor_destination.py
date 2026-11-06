@@ -16,11 +16,14 @@ class TensorDestination:
     The caller owns registration and the tensor through physical completion.
     This destination is always strict: unsupported reads must not stage through
     host memory or replace the tensor with a newly allocated result.
+    The stored member schema must declare direct_alignment. For scatter views,
+    allocation identifies the aligned output root containing the write range.
     """
 
     tensor: Any
     alignment: int = 1
     pre_registered: bool = False
+    allocation: Any = None
     _contract: tuple[Any, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -43,25 +46,51 @@ class TensorDestination:
             )
         if self.pre_registered is not True:
             raise ValueError("tensor destination requires pre_registered=True")
-        if self.tensor.numel() and self.tensor.data_ptr() % self.alignment:
+        if self.tensor.numel() and self.tensor.data_ptr() % self.tensor.element_size():
+            raise ValueError(
+                "tensor destination fragment must satisfy dtype natural alignment"
+            )
+        allocation = self.tensor if self.allocation is None else self.allocation
+        if (
+            not isinstance(allocation, torch.Tensor)
+            or not allocation.is_contiguous()
+            or allocation.layout != torch.strided
+            or allocation.device != self.tensor.device
+            or allocation.dtype != self.tensor.dtype
+        ):
+            raise ValueError(
+                "tensor destination allocation must be a contiguous tensor with the same device and dtype"
+            )
+        if self.tensor.numel() and (
+            self.tensor.data_ptr() < allocation.data_ptr()
+            or self.tensor.data_ptr() + self.tensor.numel() * self.tensor.element_size()
+            > allocation.data_ptr() + allocation.numel() * allocation.element_size()
+        ):
+            raise ValueError("tensor destination must lie inside its allocation")
+        if allocation.numel() and allocation.data_ptr() % self.alignment:
             raise ValueError("tensor destination data pointer is not aligned")
         object.__setattr__(self, "_contract", self._memory_contract())
 
     def _memory_contract(self) -> tuple[Any, ...]:
-        value = self.tensor
-        return (
-            value.data_ptr(),
-            tuple(value.shape),
-            tuple(value.stride()),
-            value.dtype,
-            value.device,
-            value.layout,
-            value.numel(),
+        def contract(value):
+            return (
+                value.data_ptr(),
+                tuple(value.shape),
+                tuple(value.stride()),
+                value.dtype,
+                value.device,
+                value.layout,
+                value.numel(),
+            )
+
+        return contract(self.tensor), contract(
+            self.tensor if self.allocation is None else self.allocation
         )
 
     def validate(self, spec: Mapping[str, Any], shape: Sequence[int]) -> int:
         if self._memory_contract() != self._contract:
             raise ValueError("tensor destination changed since registration")
+        validate_schema_destination(spec, self)
         if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
             raise ValueError("tensor destination requires a dense torch tensor member")
         if str(self.tensor.dtype) != spec.get("dtype"):
@@ -76,10 +105,40 @@ class TensorDestination:
 
 
 def tensor_destination(
-    tensor: Any, *, alignment: int = 1, pre_registered: bool = False
+    tensor: Any,
+    *,
+    alignment: int = 1,
+    pre_registered: bool = False,
+    allocation: Any = None,
 ) -> TensorDestination:
     """Wrap a registered CPU/CUDA tensor for payload-only direct materialization."""
-    return TensorDestination(tensor, alignment, pre_registered)
+    return TensorDestination(tensor, alignment, pre_registered, allocation)
+
+
+def validate_schema_destination(spec: Mapping[str, Any], destination: Any) -> None:
+    """Direct aligned reads are enabled by the stored member schema only."""
+    required = spec.get("direct_alignment")
+    if required is None:
+        if isinstance(destination, TensorDestination):
+            raise ValueError(
+                "tensor destination requires a schema with direct_alignment"
+            )
+        return
+    if (
+        isinstance(required, bool)
+        or not isinstance(required, int)
+        or required <= 0
+        or required & (required - 1)
+    ):
+        raise ValueError("invalid schema direct_alignment")
+    if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
+        raise ValueError("schema direct_alignment requires a dense torch tensor member")
+    if not isinstance(destination, TensorDestination):
+        raise ValueError(
+            "schema direct_alignment requires a registered tensor destination"
+        )
+    if destination.alignment < required:
+        raise ValueError("tensor destination alignment is weaker than its schema")
 
 
 def validate_tensor_destinations(destinations: Mapping[str, Any]) -> None:

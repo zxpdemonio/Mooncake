@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 from mooncake.store import MooncakeDistributedStore, BufferPool  # noqa: E402
 from mooncake.structured_object_store import (  # noqa: E402
     BundleTransferPolicy,
+    FieldSchema,
     MooncakeBundleTransfer,
     tensor_destination,
     tensor_object_buffer,
@@ -79,6 +80,11 @@ def test_direct_rdma_tensor_destination(direct_store, device, mode, alignment, r
             {"batch": {"selection": value}, "non_tensor_batch": {}, "meta_info": {}},
             type="dataproto",
             policy=BundleTransferPolicy(copy_mode=mode),
+            field_schemas={
+                "selection": FieldSchema(
+                    codec="torch_tensor", direct_alignment=alignment
+                )
+            },
         )
         assert direct_store.register_buffer(target.data_ptr(), nbytes) == 0
         registered = True
@@ -137,7 +143,13 @@ def test_cuda_tcp_destination_is_rejected_before_payload_write():
     transfer = MooncakeBundleTransfer(store, key_prefix="test-reject-cuda-tcp")
     source = torch.arange(12, dtype=torch.int32).view(3, 4)
     target = torch.full_like(source, -999, device="cuda")
-    ref = transfer.put({"selection": source}, type="dict")
+    ref = transfer.put(
+        {"selection": source},
+        type="dict",
+        field_schemas={
+            "selection": FieldSchema(codec="torch_tensor", direct_alignment=1),
+        },
+    )
     assert (
         store.register_buffer(target.data_ptr(), target.numel() * target.element_size())
         == 0

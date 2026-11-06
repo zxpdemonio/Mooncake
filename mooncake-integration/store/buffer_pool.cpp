@@ -1,6 +1,7 @@
 #include "buffer_pool.h"
 
 #include <pybind11/gil.h>
+#include <pybind11/stl.h>
 
 #include <atomic>
 #include <chrono>
@@ -128,7 +129,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
    public:
     BufferPoolNative(const py::object &store, size_t max_bytes,
                      size_t min_size_class, py::object max_size_class,
-                     size_t alignment, bool block_on_exhaustion,
+                     std::optional<size_t> alignment, bool block_on_exhaustion,
                      py::object default_timeout, py::object max_regions);
     ~BufferPoolNative() {
         try {
@@ -175,6 +176,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
     size_t min_size_class_ = 0;
     size_t max_size_class_ = 0;
     size_t alignment_ = 0;
+    bool align_local_ = false;
     bool block_on_exhaustion_ = true;
     std::optional<double> default_timeout_;
     std::optional<size_t> max_regions_;
@@ -265,7 +267,8 @@ void BufferLeaseNative::release_lease(bool check_exported_views) {
 
 BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
                                    size_t min_size_class,
-                                   py::object max_size_class, size_t alignment,
+                                   py::object max_size_class,
+                                   std::optional<size_t> alignment,
                                    bool block_on_exhaustion,
                                    py::object default_timeout,
                                    py::object max_regions)
@@ -273,7 +276,8 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
       py_client_(unwrap_store(store)),
       max_bytes_(max_bytes),
       min_size_class_(min_size_class),
-      alignment_(alignment),
+      alignment_(alignment.value_or(8 * 1024 * 1024)),
+      align_local_(alignment.has_value()),
       block_on_exhaustion_(block_on_exhaustion) {
     if (store_obj_.is_none() || !py_client_) {
         throw std::runtime_error("MooncakeDistributedStore is not initialized");
@@ -398,8 +402,9 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     // When padding cannot fit, the existing overflow path allocates an exact
     // size region with posix_memalign instead.
     size_t allocation_size = payload_size;
-    bool try_local = false;
-    if (payload_size <= std::numeric_limits<size_t>::max() - (alignment_ - 1)) {
+    bool try_local = !align_local_;
+    if (align_local_ &&
+        payload_size <= std::numeric_limits<size_t>::max() - (alignment_ - 1)) {
         const size_t padded_size = payload_size + alignment_ - 1;
         if (padded_size <= local_buffer_capacity_ &&
             has_capacity_for_locked(padded_size)) {
@@ -416,7 +421,7 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
             try_local ? py_client_->client_buffer_allocator_->allocate(
                             allocation_size)
                       : std::optional<BufferHandle>{};
-        if (alloc_result.has_value()) {
+        if (alloc_result.has_value() && align_local_) {
             auto backing =
                 std::make_shared<BufferHandle>(std::move(*alloc_result));
             const uintptr_t base = reinterpret_cast<uintptr_t>(backing->ptr());
@@ -424,6 +429,8 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
             handle = std::make_shared<BufferHandle>(
                 reinterpret_cast<void *>(base + offset), payload_size,
                 [backing = std::move(backing)]() mutable { backing.reset(); });
+        } else if (alloc_result.has_value()) {
+            handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
         } else {
             handle = allocate_overflow_unlocked(payload_size);
             overflow_registered = handle != nullptr;
@@ -578,9 +585,10 @@ void bind_buffer_pool(py::module &m) {
         m, "BufferPool")
         .def(py::init([](const py::object &store, size_t max_bytes,
                          size_t min_size_class, py::object max_size_class,
-                         size_t alignment, bool block_on_exhaustion,
-                         py::object default_timeout, py::object max_regions,
-                         py::object prewarm_size, size_t prewarm_count) {
+                         std::optional<size_t> alignment,
+                         bool block_on_exhaustion, py::object default_timeout,
+                         py::object max_regions, py::object prewarm_size,
+                         size_t prewarm_count) {
                  auto pool = std::make_shared<BufferPoolNative>(
                      store, max_bytes, min_size_class, max_size_class,
                      alignment, block_on_exhaustion, default_timeout,
@@ -593,7 +601,7 @@ void bind_buffer_pool(py::module &m) {
              py::arg("store"), py::arg("max_bytes") = 0,
              py::arg("min_size_class") = 64 * 1024,
              py::arg("max_size_class") = py::none(),
-             py::arg("alignment") = 8 * 1024 * 1024,
+             py::arg("alignment") = py::none(),
              py::arg("block_on_exhaustion") = true,
              py::arg("default_timeout") = py::none(),
              py::arg("max_regions") = py::none(),

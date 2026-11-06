@@ -5223,3 +5223,35 @@ def test_session_config_expands_with_physical_keys_without_mutating_input():
         _config_for_grouped_keys(
             SimpleNamespace(per_key_preferred_hca_names=[["mlx5_0"], []]), 2
         )
+
+
+@pytest.mark.parametrize("alias", ["row", "detach", "view"])
+def test_decoded_ragged_torch_row_retains_pool_lease_after_container_dies(alias):
+    import gc
+
+    torch = pytest.importorskip("torch")
+    pool = FakeBufferPool()
+    lease = pool.acquire(12)
+    owner = sos._PoolLeaseOwner(lease)
+    data = sos._PoolBackedNdarray(owner, np.dtype(np.float32), (3,))
+    data[:] = [1, 2, 3]
+    payload, metadata = sos._encode_ragged_tensor_values(
+        [
+            torch.tensor([1.0]),
+            torch.tensor([2.0, 3.0]),
+        ]
+    )
+    payload["data"] = data
+    result = sos._decode_ragged_tensor_values(payload, 2, metadata)
+    row = result[1]
+    if alias == "detach":
+        row = row.detach()
+    elif alias == "view":
+        row = row.view(-1)
+    del result, payload, data, owner
+    gc.collect()
+    assert not lease.released
+    torch.testing.assert_close(row, torch.tensor([2.0, 3.0]))
+    del row
+    gc.collect()
+    assert lease.released

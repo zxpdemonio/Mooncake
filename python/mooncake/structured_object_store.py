@@ -29,6 +29,7 @@ from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
 from mooncake._tensor_destination import (
     TensorDestination,
     tensor_destination as tensor_destination,
+    validate_schema_destination,
     validate_tensor_destinations,
 )
 from mooncake._structured_ranges import (
@@ -89,15 +90,34 @@ class BundleTransferPolicy:
 
 @dataclass(frozen=True)
 class FieldSchema:
-    """Schema hint for DataProto fields.
+    """Codec and optional materialization requirements for structured fields.
 
     ``metadata["section"]`` may pin a field to ``batch``,
     ``non_tensor_batch``, or ``meta_info``.
+    ``direct_alignment`` opts a dense tensor member into strict direct reads;
+    omitting it preserves ordinary materialization.
     """
 
     codec: str
     nullable: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    direct_alignment: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.direct_alignment is None:
+            return
+        alignment = self.direct_alignment
+        if (
+            isinstance(alignment, bool)
+            or not isinstance(alignment, int)
+            or alignment <= 0
+            or alignment & (alignment - 1)
+        ):
+            raise ValueError(
+                "FieldSchema direct_alignment must be a positive power of two"
+            )
+        if self.codec != "torch_tensor":
+            raise ValueError("direct_alignment requires the torch_tensor codec")
 
 
 @dataclass
@@ -114,16 +134,19 @@ class StructuredObjectPayload:
 
     metadata: Mapping[str, Any]
     buffers: Mapping[str, Any]
+    field_schemas: Mapping[str, FieldSchema]
 
     def __init__(
         self,
         metadata: Optional[Mapping[str, Any]] = None,
         buffers: Optional[Mapping[str, Any]] = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> None:
         if buffers is None:
             raise TypeError("StructuredObjectPayload requires buffers")
         object.__setattr__(self, "metadata", {} if metadata is None else metadata)
         object.__setattr__(self, "buffers", buffers)
+        object.__setattr__(self, "field_schemas", dict(field_schemas or {}))
 
 
 @dataclass
@@ -1210,6 +1233,7 @@ class MooncakeBundleTransfer:
         field_spec = _structured_field_specs(metadata).get(
             member, {"encoding": "bytes"}
         )
+        validate_schema_destination(field_spec, destination)
         payload_spec = manifest["buffers"][member]
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "ndarray":
@@ -2001,6 +2025,13 @@ class MooncakeBundleTransfer:
                 },
             },
             buffers=buffers,
+            field_schemas={
+                f"batch.{name}": schema
+                for name in batch
+                if (schema := _schema_for_section(field_schemas, name, "batch"))
+                is not None
+                and schema.direct_alignment is not None
+            },
         )
         existing_stage_ref = ref.stage_refs.get(stage) if ref is not None else None
         if existing_stage_ref is not None and not overwrite:
@@ -2594,6 +2625,14 @@ def _validate_dataproto_schema_sections(
         for name in fields:
             actual_sections.setdefault(name, set()).add(section)
     for name, schema in field_schemas.items():
+        if (
+            schema.direct_alignment is not None
+            and name in actual_sections
+            and actual_sections[name] != {"batch"}
+        ):
+            raise ValueError(
+                "direct_alignment requires a dense tensor in the batch section"
+            )
         declared = _schema_section(name, schema)
         if declared is None:
             continue
@@ -3108,16 +3147,24 @@ def _decode_ragged_tensor_values(
     patched_meta = dict(metadata) if metadata else {}
     patched_meta["dtype"] = str(np_dtype)
     np_values = _decode_typed_ragged_values(payload, rows, patched_meta)
+    owner = getattr(np_values, "_mooncake_pool_owner", None)
     torch_dtype = _parse_torch_dtype(dtype_str)
     result: list[Any] = []
     for v in np_values:
         if v is None:
             result.append(None)
         elif isinstance(v, np.ndarray):
+            if owner is not None:
+                # Torch storage retains this ndarray, including across detach
+                # and other aliases that do not retain Tensor attributes.
+                v = v.view(_PoolBackedNdarray)
+                v._mooncake_pool_owner = owner
             result.append(_torch.from_numpy(v).to(torch_dtype))
         else:
             result.append(_torch.as_tensor(v, dtype=torch_dtype))
-    return result
+        if owner is not None and result[-1] is not None:
+            result[-1]._mooncake_pool_owner = owner
+    return _OwnerBackedList(result, owner) if owner is not None else result
 
 
 def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
@@ -3611,7 +3658,9 @@ class _StructuredObjectLayer:
         max_inflight_put: Optional[int],
         config: Any = None,
     ) -> RemoteBundleRef:
-        metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
+        metadata, buffers = _encode_structured_fields(
+            payload.metadata, payload.buffers, payload.field_schemas
+        )
         transfer_policy = self._bundle_store._policy(
             policy, max_inflight_put=max_inflight_put
         )
@@ -3646,7 +3695,14 @@ class _StructuredObjectLayer:
             raise TypeError(
                 "structured ranged destinations must map members to raw_destination"
             )
-        return self._resolve_structured_read(spec)
+        resolved = self._resolve_structured_read(spec)
+        fields = _structured_field_specs(resolved[0])
+        for member in resolved[2]:
+            if fields.get(member, {}).get("direct_alignment") is not None:
+                raise ValueError(
+                    "schema direct_alignment requires typed tensor materialization"
+                )
+        return resolved
 
     def materialize_ranges_into(
         self,
@@ -3754,6 +3810,7 @@ class _StructuredObjectLayer:
             buffers, fields = stage_cache[manifest_key]
             payload_spec = buffers[member]
             field_spec = fields.get(member, {"encoding": "bytes"})
+            validate_schema_destination(field_spec, destination)
             is_matrix = (
                 field_spec.get("encoding") in {"ndarray", "torch_tensor"}
                 and not field_spec.get("nested")
@@ -3841,6 +3898,7 @@ class _StructuredObjectLayer:
         *,
         use_buffer_pool: bool = True,
     ) -> Any:
+        validate_schema_destination(field_spec, destination)
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "bytes":
             return self._read_bytes_member(
@@ -6117,13 +6175,26 @@ def _normalize_structured_metadata(metadata: Mapping[str, Any]) -> dict[str, Any
 def _encode_structured_fields(
     metadata: Mapping[str, Any],
     fields: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     normalized_metadata = _normalize_structured_metadata(metadata)
     field_specs: dict[str, Any] = {}
     encoded_fields: dict[str, Any] = {}
+    schemas = field_schemas or {}
+    if unknown := set(schemas) - set(fields):
+        raise ValueError(
+            f"schemas reference unknown structured members: {sorted(unknown)}"
+        )
     for name, value in fields.items():
         _validate_key_segment(name, "buffer name")
         spec, encoded_value = _encode_structured_field(value)
+        schema = schemas.get(name)
+        if schema is not None and schema.direct_alignment is not None:
+            if spec.get("encoding") != "torch_tensor" or spec.get("nested"):
+                raise ValueError(
+                    "direct_alignment requires a dense torch tensor member"
+                )
+            spec["direct_alignment"] = schema.direct_alignment
         field_specs[name] = spec
         encoded_fields[name] = encoded_value
     if field_specs:

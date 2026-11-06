@@ -6,6 +6,8 @@ torch = pytest.importorskip("torch")
 
 from mooncake.structured_object_store import (  # noqa: E402
     BundleTransferPolicy,
+    FieldSchema,
+    StructuredObjectPayload,
     tensor_destination,
 )
 from test_structured_object_store import NoTensorFastPathStore, make_transfer  # noqa: E402
@@ -36,7 +38,10 @@ def test_direct_tensor_payload_uses_caller_tensor_without_deserialization(
     source = torch.full((3, 2, 16), -1, dtype=torch.int32)
     source[..., :9] = torch.arange(54, dtype=torch.int32).view(3, 2, 9)
     ref = transfer.put(
-        {"value": source}, type="dict", policy=BundleTransferPolicy(copy_mode=mode)
+        {"value": source},
+        type="dict",
+        policy=BundleTransferPolicy(copy_mode=mode),
+        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
     )
     expected = source if rows is None else source[rows]
     target = aligned_tensor(expected.shape)
@@ -77,7 +82,10 @@ def test_direct_tensor_read_fails_without_staging(change):
     store, transfer = make_transfer(DirectStore())
     source = torch.zeros((2, 16), dtype=torch.int32)
     ref = transfer.put(
-        {"value": source}, type="dict", policy=BundleTransferPolicy(copy_mode="copy")
+        {"value": source},
+        type="dict",
+        policy=BundleTransferPolicy(copy_mode="copy"),
+        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=1)},
     )
     target = aligned_tensor((2, 16) if change != "shape" else (1, 32))
     if change == "dtype":
@@ -112,6 +120,10 @@ def test_direct_destinations_reject_aliases_before_payload_read(offset):
         {"a": source, "b": source * 2},
         type="dict",
         policy=BundleTransferPolicy(copy_mode="copy"),
+        field_schemas={
+            key: FieldSchema(codec="torch_tensor", direct_alignment=1)
+            for key in ("a", "b")
+        },
     )
     allocation = aligned_tensor((40,))
     first = allocation[:32].view(2, 16)
@@ -126,3 +138,97 @@ def test_direct_destinations_reject_aliases_before_payload_read(offset):
             },
         )
     assert store.get_into_ranges_calls == 0
+
+
+def test_only_declared_schema_enables_direct_reads(monkeypatch):
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    source = torch.arange(32, dtype=torch.int32).view(2, 16)
+    plain = transfer.put({"value": source}, type="dict")
+    target = aligned_tensor(source.shape)
+    with pytest.raises(ValueError, match="schema with direct_alignment"):
+        transfer.get(
+            plain,
+            type="dict",
+            destinations={
+                "value": tensor_destination(target, alignment=64, pre_registered=True),
+            },
+        )
+    torch.testing.assert_close(transfer.get(plain, type="dict")["value"], source)
+    special = transfer.put(
+        {"value": source},
+        type="dict",
+        field_schemas={
+            "value": FieldSchema(codec="torch_tensor", direct_alignment=64),
+        },
+    )
+    with pytest.raises(ValueError, match="registered tensor destination"):
+        transfer.get(special, type="dict")
+    with pytest.raises(ValueError, match="weaker than its schema"):
+        transfer.get(
+            special,
+            type="dict",
+            destinations={
+                "value": tensor_destination(target, alignment=4, pre_registered=True),
+            },
+        )
+
+
+@pytest.mark.parametrize("alignment", [True, 0, -1, 3, "64"])
+def test_schema_rejects_invalid_direct_alignment(alignment):
+    with pytest.raises(ValueError, match="direct_alignment"):
+        FieldSchema(codec="torch_tensor", direct_alignment=alignment)
+
+
+def test_structured_schema_requires_dense_tensors():
+    with pytest.raises(ValueError, match="torch_tensor codec"):
+        FieldSchema(codec="utf8_ragged", direct_alignment=64)
+    store, transfer = make_transfer(NoTensorFastPathStore())
+    with pytest.raises(ValueError, match="dense torch tensor"):
+        transfer.put_structured_object(
+            StructuredObjectPayload(
+                buffers={"value": b"abc"},
+                field_schemas={
+                    "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
+                },
+            )
+        )
+
+
+def test_direct_scatter_keeps_schema_alignment_on_output_allocation():
+    store, transfer = make_transfer(DirectStore())
+    source = torch.arange(6, dtype=torch.int32).view(3, 2)
+    ref = transfer.put(
+        {"value": source},
+        type="dict",
+        field_schemas={
+            "value": FieldSchema(codec="torch_tensor", direct_alignment=64),
+        },
+    )
+    allocation = aligned_tensor((3, 2))
+    destination = tensor_destination(
+        allocation[1:], alignment=64, pre_registered=True, allocation=allocation
+    )
+    result = transfer.get(
+        ref, type="dict", rows=[2, 0], destinations={"value": destination}
+    )
+    assert result["value"] is destination.tensor
+    torch.testing.assert_close(allocation[1:], source[[2, 0]])
+    with pytest.raises(ValueError, match="inside its allocation"):
+        tensor_destination(
+            aligned_tensor((2, 2)),
+            alignment=64,
+            pre_registered=True,
+            allocation=allocation,
+        )
+
+
+def test_scatter_fragment_requires_natural_dtype_alignment():
+    import ctypes
+
+    root = aligned_tensor((32,))
+    buffer = (ctypes.c_ubyte * (root.numel() * root.element_size())).from_address(
+        root.data_ptr()
+    )
+    fragment = torch.frombuffer(buffer, dtype=torch.int32, count=2, offset=1)
+    with pytest.raises(ValueError, match="natural alignment"):
+        tensor_destination(fragment, alignment=64, pre_registered=True, allocation=root)
