@@ -389,21 +389,43 @@ std::shared_ptr<BufferLeaseNative> BufferPoolNative::make_lease_locked(
 
 std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     std::unique_lock<std::mutex> &lock, size_t requested_size) {
-    const size_t allocation_size = std::max<size_t>(requested_size, 1);
-    if (!has_capacity_for_locked(allocation_size)) {
+    const size_t payload_size = std::max<size_t>(requested_size, 1);
+    if (!has_capacity_for_locked(payload_size)) {
         return std::nullopt;
+    }
+    // The local arena's base is only cache-line aligned. Reserve the padding
+    // as well, then retain the original allocation behind the aligned view.
+    // When padding cannot fit, the existing overflow path allocates an exact
+    // size region with posix_memalign instead.
+    size_t allocation_size = payload_size;
+    bool try_local = false;
+    if (payload_size <= std::numeric_limits<size_t>::max() - (alignment_ - 1)) {
+        const size_t padded_size = payload_size + alignment_ - 1;
+        if (padded_size <= local_buffer_capacity_ &&
+            has_capacity_for_locked(padded_size)) {
+            allocation_size = padded_size;
+            try_local = true;
+        }
     }
     reserve_locked(allocation_size);
     lock.unlock();
     std::shared_ptr<BufferHandle> handle;
     bool overflow_registered = false;
     try {
-        if (auto alloc_result =
-                py_client_->client_buffer_allocator_->allocate(allocation_size);
-            alloc_result.has_value()) {
-            handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+        auto alloc_result =
+            try_local ? py_client_->client_buffer_allocator_->allocate(
+                            allocation_size)
+                      : std::optional<BufferHandle>{};
+        if (alloc_result.has_value()) {
+            auto backing =
+                std::make_shared<BufferHandle>(std::move(*alloc_result));
+            const uintptr_t base = reinterpret_cast<uintptr_t>(backing->ptr());
+            const size_t offset = (alignment_ - base % alignment_) % alignment_;
+            handle = std::make_shared<BufferHandle>(
+                reinterpret_cast<void *>(base + offset), payload_size,
+                [backing = std::move(backing)]() mutable { backing.reset(); });
         } else {
-            handle = allocate_overflow_unlocked(allocation_size);
+            handle = allocate_overflow_unlocked(payload_size);
             overflow_registered = handle != nullptr;
         }
     } catch (...) {
@@ -426,6 +448,7 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
         lock.lock();
         throw std::runtime_error("buffer pool is closing");
     }
+    if (overflow_registered) allocation_size = payload_size;
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
     Region region{handle, allocation_size, overflow_registered};
     regions_.emplace(ptr, region);

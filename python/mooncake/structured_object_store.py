@@ -5,6 +5,7 @@ import ctypes
 import importlib
 import io
 import json
+import math
 import sys
 import uuid
 from collections.abc import MutableMapping
@@ -25,6 +26,11 @@ from typing import (
 import numpy as np
 
 from mooncake._partial_read import MatrixReadPlan, plan_matrix_read
+from mooncake._tensor_destination import (
+    TensorDestination,
+    tensor_destination as tensor_destination,
+    validate_tensor_destinations,
+)
 from mooncake._structured_ranges import (
     PreparedRangeLayoutChanged as PreparedRangeLayoutChanged,
     PreparedStructuredMemberRanges,
@@ -1003,6 +1009,7 @@ class MooncakeBundleTransfer:
         matrix_slices = dict(batch_slices or {})
         non_tensor_batch: dict[str, Any] = {}
         destination_map = destinations or {}
+        validate_tensor_destinations(destination_map)
         batch, matrix_reads = (
             self._read_dataproto_matrices(
                 ref, batch_names, row_slice, row_indices, matrix_slices, destination_map
@@ -1165,6 +1172,13 @@ class MooncakeBundleTransfer:
                 raise ValueError(f"DataProto matrix field {name!r} is not selected")
         names = [name for name in batch_names if include_rows or name in slices]
         for name in names:
+            if isinstance(destinations.get(name), TensorDestination):
+                if name in slices:
+                    raise ValueError(
+                        "direct tensor destinations do not support batch_slices"
+                    )
+                # The payload-only tensor reader handles row gathers directly.
+                continue
             columns = slices.get(name, slice(None))
             if not isinstance(columns, slice):
                 raise TypeError(f"DataProto batch_slices for {name!r} must be a slice")
@@ -1293,6 +1307,10 @@ class MooncakeBundleTransfer:
         indices: Sequence[int],
         destination: Any,
     ) -> Any:
+        if isinstance(destination, TensorDestination):
+            return self._structured_store._read_tensor_destination(
+                name, payload_spec, field_spec, destination, indices
+            )
         if payload_spec.get("format") == "torch_save":
             if destination is not None:
                 raise ValueError(
@@ -3703,6 +3721,7 @@ class _StructuredObjectLayer:
         metadata, buffers, selected = self._resolve_structured_read(spec)
         field_specs = _structured_field_specs(metadata)
         destination_map = destinations or {}
+        validate_tensor_destinations(destination_map)
         member_slices = dict(spec.member_slices)
         objects = {
             name: self._read_structured_member(
@@ -3850,6 +3869,10 @@ class _StructuredObjectLayer:
         member_slice: StructuredMemberSlice | None,
         destination: Any,
     ) -> Any:
+        if isinstance(destination, TensorDestination):
+            return self._read_tensor_destination(
+                name, payload_spec, field_spec, destination, member_slice
+            )
         if field_spec.get("nested"):
             if destination is not None:
                 raise ValueError(
@@ -3890,6 +3913,84 @@ class _StructuredObjectLayer:
         return _deserialize_tensor_payload(
             self._bundle_store.read_payload(payload_spec)
         )
+
+    def _read_tensor_destination(
+        self,
+        name: str,
+        payload_spec: Mapping[str, Any],
+        field_spec: Mapping[str, Any],
+        destination: TensorDestination,
+        indices: Sequence[int] | StructuredMemberSlice | None,
+    ) -> Any:
+        if payload_spec.get("format") == "torch_save":
+            raise ValueError("direct tensor reads do not support torch_save payloads")
+        # Existing zero-copy tensor-object buffers carry their schema in the
+        # native header rather than the structured manifest. Fetch only that
+        # prefix and reuse the native codec's validation, never deserialize the
+        # payload into a temporary host tensor.
+        if "shape" not in field_spec or "metadata_bytes" not in payload_spec:
+            prefix = self._bundle_store.read_payload_range(
+                payload_spec, 0, _tensor_metadata_size()
+            )
+            schema = _tensor_codec_helper("_tensor_metadata_spec")(
+                prefix, int(payload_spec["bytes"])
+            )
+            field_spec = {**field_spec, **schema}
+            payload_spec = {**payload_spec, "metadata_bytes": schema["metadata_bytes"]}
+        shape = field_spec.get("shape")
+        metadata_bytes = payload_spec.get("metadata_bytes")
+        if (
+            not isinstance(shape, list)
+            or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim < 0
+                for dim in shape
+            )
+            or isinstance(metadata_bytes, bool)
+            or not isinstance(metadata_bytes, int)
+            or metadata_bytes < 0
+        ):
+            raise ValueError(
+                "direct tensor read requires typed shape and metadata size"
+            )
+        if isinstance(indices, StructuredMemberSlice):
+            if indices.axis != 0 or not shape:
+                raise ValueError("direct tensor slicing requires axis=0")
+            indices = range(*_normalized_member_slice(indices, shape[0]))
+        if indices is not None and not shape:
+            raise ValueError("direct indexed tensor read requires a batch dimension")
+        output_shape = shape if indices is None else [len(indices), *shape[1:]]
+        nbytes = destination.validate(field_spec, output_shape)
+        stored_bytes = math.prod(shape) * destination.tensor.element_size()
+        if int(payload_spec["bytes"]) != metadata_bytes + stored_bytes:
+            raise ValueError("direct tensor payload byte length differs from schema")
+        if indices is None:
+            ranges = [(metadata_bytes, 0, nbytes)] if nbytes else []
+        else:
+            row_bytes = math.prod(shape[1:]) * destination.tensor.element_size()
+            if any(row < 0 or row >= shape[0] for row in indices):
+                raise ValueError("direct tensor row index is out of bounds")
+            ranges = [
+                (metadata_bytes + row * row_bytes, out * row_bytes, row_bytes)
+                for out, row in enumerate(indices)
+                if row_bytes
+            ]
+        transport = self._bundle_store._transport
+        if not callable(transport._get_into_ranges):
+            raise RuntimeError(
+                "direct tensor read requires get_into_ranges; staging is disabled"
+            )
+        tensor = destination.tensor
+        if tensor.device.type == "cuda":
+            # Finish prior CUDA work before an external device writes the tensor.
+            _torch.cuda.current_stream(tensor.device).synchronize()
+        if ranges and not transport.read_payload_ranges_into_raw_destination(
+            payload_spec, tensor.data_ptr(), ranges, require_direct=True
+        ):
+            raise RuntimeError("direct tensor read is unavailable; staging is disabled")
+        # Native strict reads return after physical drain. The caller submits
+        # consumer CUDA work after this return, establishing the required host
+        # work-submission ordering without synchronizing unrelated GPU streams.
+        return tensor
 
     def _read_sliced_torch_tensor_member(
         self,
@@ -4406,6 +4507,7 @@ class _BundleManifestStore:
                     "key": key,
                     "bytes": total_bytes,
                     "chunks": [{"key": key, "bytes": total_bytes}],
+                    "metadata_bytes": _tensor_metadata_size(),
                 }, [key]
             except RuntimeError:
                 pass
@@ -4987,9 +5089,14 @@ class _MooncakePayloadTransport:
         payload_spec: Mapping[str, Any],
         destination_ptr: int,
         ranges: Sequence[tuple[int, int, int]],
+        *,
+        require_direct: bool = False,
     ) -> bool:
         return self._read_payload_ranges_into_raw_destination(
-            payload_spec["chunks"], destination_ptr, ranges
+            payload_spec["chunks"],
+            destination_ptr,
+            ranges,
+            require_direct=require_direct,
         )
 
     def read_payload_ranges_batch(
@@ -5341,6 +5448,8 @@ class _MooncakePayloadTransport:
         chunks: Sequence[Mapping[str, Any]],
         base_ptr: int,
         ranges: Sequence[tuple[int, int, int]],
+        *,
+        require_direct: bool = False,
     ) -> bool:
         get_into_ranges = self._get_into_ranges
         if not callable(get_into_ranges):
@@ -5370,8 +5479,11 @@ class _MooncakePayloadTransport:
             [size]
             for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
         ]
-        results = get_into_ranges(
-            [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
+        arguments = ([base_ptr], [keys], [dst_offsets], [src_offsets], [sizes])
+        results = (
+            get_into_ranges(*arguments, require_direct=True)
+            if require_direct
+            else get_into_ranges(*arguments)
         )
         if len(results) != 1 or len(results[0]) != len(keys):
             raise RuntimeError(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import threading
 import time
 
@@ -19,7 +20,7 @@ def create_store() -> MooncakeDistributedStore:
         4 * 1024 * 1024,
         "tcp",
         "",
-        "127.0.0.1:50051",
+        os.getenv("MOONCAKE_ALIGNMENT_MASTER", "127.0.0.1:50051"),
     )
     assert rc == 0
     return store
@@ -79,12 +80,17 @@ def test_buffer_pool_prewarm_and_close() -> None:
     pool.close()
 
 
-def test_buffer_pool_uses_local_buffer_alignment() -> None:
+@pytest.mark.parametrize("alignment", [64, 4096, 65536])
+def test_buffer_pool_uses_local_buffer_alignment(alignment: int) -> None:
     store = create_store()
-    pool = BufferPool(store, min_size_class=4096, alignment=65536)
+    pool = BufferPool(store, min_size_class=4096, alignment=alignment)
 
-    lease = pool.acquire(1024)
-    assert lease.ptr % 64 == 0
+    leases = [pool.acquire(size) for size in (1, 67, 1024)]
+    for lease in leases:
+        assert lease.ptr % alignment == 0
+        lease.release()
+    lease = pool.acquire(73)
+    assert lease.ptr % alignment == 0
     lease.release()
     pool.close()
 

@@ -832,6 +832,11 @@ class Client {
                transfer_engine_->getTransport(protocol) != nullptr;
     }
 
+    // Check the TE segment used for routing, not the Store allocator's
+    // protocol hint (which may still contain its historical TCP default).
+    [[nodiscard]] bool CanReadDirectToDevice(const Replica::Descriptor& replica,
+                                             bool destination_registered) const;
+
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
                transfer_submitter_->canUseLocalMemcpy(endpoint);

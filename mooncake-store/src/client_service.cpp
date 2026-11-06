@@ -1702,6 +1702,24 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+bool Client::CanReadDirectToDevice(const Replica::Descriptor& replica,
+                                   bool destination_registered) const {
+    if (!replica.is_memory_replica() || !transfer_engine_ ||
+        transfer_engine_->isUsingTent()) {
+        return false;
+    }
+    const auto& endpoint =
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    auto metadata = transfer_engine_->getMetadata();
+    auto segment = metadata->getSegmentDescByName(endpoint);
+    // Only homogeneous transports with a direct device-memory path qualify.
+    // Mixed-protocol selection is address-dependent; do not guess its route.
+    return segment &&
+           (segment->protocol == "nvlink" ||
+            (segment->protocol == "rdma" && destination_registered)) &&
+           HasClassicTransport(segment->protocol);
+}
+
 std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
     TransferIntent intent) {

@@ -4914,20 +4914,12 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 
 bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
                                             void *buffer, size_t size) const {
-    if (!replica.is_memory_replica()) return false;
-    // The selected replica's descriptor controls Transfer Engine routing.
-    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
-    // requires the destination range to have a local memory registration.
-    const std::string &replica_protocol =
-        replica.get_memory_descriptor().buffer_descriptor.protocol_;
-    if (replica_protocol == "nvlink") {
-        return true;
-    }
-    if (replica_protocol != "rdma") {
-        return false;
-    }
+    // RDMA requires registration; preserve NVLink's ordinary CUDA allocation
+    // support for existing non-strict callers.
     auto region = resolve_writable_buffer_region(buffer);
-    return region.has_value() && size <= region->size - region->offset;
+    const bool registered =
+        region.has_value() && size <= region->size - region->offset;
+    return client_ && client_->CanReadDirectToDevice(replica, registered);
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -5267,7 +5259,8 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh,
+    bool direct_only) {
     auto results = build_ranged_read_internal_error_results(
         buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
@@ -5346,8 +5339,20 @@ RealClient::get_into_ranges_internal(
             }
 
             const auto &metadata = metadata_result.value();
+            if (direct_only &&
+                (!metadata.replica.is_memory_replica() ||
+                 (runtime_accelerator.FindDeviceForPointer(buffers[i]) &&
+                  !can_use_direct_memory_read(metadata.replica, buffers[i],
+                                              capacities[i])))) {
+                LOG(ERROR) << "Strict direct read has no supported memory path "
+                           << "for key " << keys[j];
+                std::fill(range_results.begin(), range_results.end(),
+                          tl::unexpected(ErrorCode::INVALID_REPLICA));
+                continue;
+            }
             if (metadata.replica.is_memory_replica()) {
-                if (client_->CanUseLocalMemcpy(metadata.replica) &&
+                if (!direct_only &&
+                    client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
                     if (!allow_query_refresh) {
                         for (size_t k = 0; k < range_results.size(); ++k) {
@@ -5481,7 +5486,12 @@ RealClient::get_into_ranges_internal(
                     if (select_replica(candidates.replicas,
                                        std::span<const Slice>(&destination, 1),
                                        selected) != ErrorCode::OK ||
-                        !selected.is_memory_replica()) {
+                        !selected.is_memory_replica() ||
+                        (direct_only &&
+                         runtime_accelerator.FindDeviceForPointer(
+                             destination.ptr) &&
+                         !can_use_direct_memory_read(selected, destination.ptr,
+                                                     destination.size))) {
                         range_results[k] =
                             tl::unexpected(ErrorCode::INVALID_REPLICA);
                         continue;
@@ -5581,6 +5591,26 @@ RealClient::get_into_ranges_internal(
         refresh_leases();
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+RealClient::get_into_ranges_direct(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+#ifdef USE_TENT
+    // Strict reads must retain the caller's destination until physical drain.
+    // The Store TENT scatter timeout currently releases its logical batch
+    // first.
+    return convert_ranged_read_results(build_ranged_read_internal_error_results(
+        buffers.size(), all_keys, all_dst_offsets, ErrorCode::NOT_SUPPORTED));
+#else
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
+        nullptr, true, true));
+#endif
 }
 
 std::vector<std::vector<std::vector<int64_t>>>
