@@ -4262,6 +4262,9 @@ class _BundleManifestStore:
             for name, value in buffers.items():
                 _validate_key_segment(name, "buffer name")
                 payload_key = f"{base_key}/buffer/{name}"
+                # A failed return may follow a committed single-object write.
+                # This root belongs to the new bundle, never a borrowed buffer.
+                written_keys.append(payload_key)
                 if isinstance(value, (_TensorPayload, _TensorObjectBufferPayload)):
                     payload_spec, payload_keys = self._put_tensor_payload(
                         payload_key,
@@ -4304,6 +4307,7 @@ class _BundleManifestStore:
                 "buffers": buffer_specs,
             }
             manifest_blob = _encode_manifest(manifest)
+            written_keys.append(manifest_key)
             _check_status(
                 _put_with_optional_config(
                     self._store, manifest_key, manifest_blob, config
@@ -4311,7 +4315,6 @@ class _BundleManifestStore:
                 "put",
                 manifest_key,
             )
-            written_keys.append(manifest_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
             raise
@@ -4367,6 +4370,7 @@ class _BundleManifestStore:
                 manifest["cleanup_keys"] = cleanup_key_list
             self._validate_manifest(manifest)
             manifest_blob = _encode_manifest(manifest)
+            written_keys.append(manifest_key)
             _check_status(
                 _put_with_optional_config(
                     self._store, manifest_key, manifest_blob, config
@@ -4374,7 +4378,6 @@ class _BundleManifestStore:
                 "put",
                 manifest_key,
             )
-            written_keys.append(manifest_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
             raise
@@ -5383,7 +5386,6 @@ class _MooncakePayloadTransport:
         chunks: Iterable[memoryview],
         config: Any = None,
     ) -> list[str]:
-        written_keys: list[str] = []
         try:
             for chunk_key, chunk in zip(chunk_keys, chunks):
                 _check_status(
@@ -5391,9 +5393,10 @@ class _MooncakePayloadTransport:
                     "put",
                     chunk_key,
                 )
-                written_keys.append(chunk_key)
         except Exception:
-            _cleanup_keys(self._store, written_keys, strict=False)
+            # The failed call's result is uncertain. All keys are allocated in
+            # this write's new namespace, so include attempted chunks too.
+            _cleanup_keys(self._store, chunk_keys, strict=False)
             raise
         return list(chunk_keys)
 
