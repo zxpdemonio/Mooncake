@@ -3205,19 +3205,30 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "put_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               uintptr_t buffer_ptr, size_t size, const ReplicateConfig &config,
+               bool require_direct) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                if (require_direct) {
+                    if (!self.real_client_ || self.use_dummy_client_) {
+                        throw std::runtime_error(
+                            "direct writes require an in-process RealClient");
+                    }
+                    py::gil_scoped_release release;
+                    return self.real_client_->put_from_direct(key, buffer, size,
+                                                              config);
+                }
                 py::gil_scoped_release release;
                 return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             py::arg("config") = ReplicateConfig{},
-            "Put object data directly from a pre-allocated buffer")
+            py::arg("require_direct") = false,
+            "Put data from a buffer; require_direct enforces registered-source "
+            "classic RDMA with physical completion and no staging")
         .def(
             "put_from_with_metadata",
             [](MooncakeStorePyWrapper &self, const std::string &key,

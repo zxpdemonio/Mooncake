@@ -343,55 +343,119 @@ class BoundedPayloadStore(DirectStore):
     """A copy buffer holds at most4096 bytes; large native tensors cannot fit."""
 
     def put(self, key, value, config=None):
-        if '/buffer/' in key and len(value) > 4096:
+        if "/buffer/" in key and len(value) > 4096:
             return -600
         return super().put(key, value, config=config)
 
     def put_tensor(self, *args, **kwargs):
-        pytest.fail('large direct tensor used the single-object native path')
+        pytest.fail("large direct tensor used the single-object native path")
 
     pub_tensor = put_tensor
 
+    def put_from(self, key, ptr, size, config=None, *, require_direct=False):
+        if not require_direct:
+            return super().put_from(key, ptr, size, config=config)
+        source, host = self.device_source
+        if source.data_ptr() not in self.registered:
+            return -500
+        offset = ptr - source.data_ptr()
+        assert 0 <= offset <= source.nbytes - size
+        assert size <= 4096
+        self.strict_put_calls += 1
+        return self.put(
+            key,
+            memoryview(host.numpy()).cast("B")[offset : offset + size],
+            config=config,
+        )
 
-@pytest.mark.parametrize('mode', ['copy', 'auto'])
-@pytest.mark.parametrize('rows', [None, [2, 0, 2]])
-@pytest.mark.parametrize('chunk_bytes', [128, 257, 4096])
-@pytest.mark.parametrize('non_contiguous', [False, True])
-def test_large_direct_schema_respects_chunk_bytes(mode, rows, chunk_bytes, non_contiguous):
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
+@pytest.mark.parametrize("rows", [None, [2, 0, 2]])
+@pytest.mark.parametrize("chunk_bytes", [128, 257, 4096])
+@pytest.mark.parametrize("non_contiguous", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_large_direct_schema_respects_chunk_bytes(
+    mode, rows, chunk_bytes, non_contiguous, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
     store, transfer = make_transfer(BoundedPayloadStore())
-    source = torch.arange(3 * 2 * 1024, dtype=torch.int32).view(3, 2, 1024)
+    source = torch.arange(3 * 2 * 1024, dtype=torch.int32, device=device).view(
+        3, 2, 1024
+    )
     if non_contiguous:
         source = source.transpose(1, 2)
+    direct_device = device == "cuda" and mode == "auto" and not non_contiguous
+    store.strict_put_calls = 0
+    if direct_device:
+        store.device_source = (source, source.cpu())
+        assert store.register_buffer(source.data_ptr(), source.nbytes) == 0
     ref = transfer.put(
-        {'value': source}, type='dict', chunk_bytes=chunk_bytes,
+        {"value": source},
+        type="dict",
+        chunk_bytes=chunk_bytes,
         policy=BundleTransferPolicy(copy_mode=mode),
-        field_schemas={'value': FieldSchema(codec='torch_tensor', direct_alignment=64)},
+        field_schemas={"value": FieldSchema(codec="torch_tensor", direct_alignment=64)},
     )
-    location = ref.field_index['value']
+    if direct_device:
+        assert store.unregister_buffer(source.data_ptr()) == 0
+        assert store.strict_put_calls > 0
+    location = ref.field_index["value"]
     manifest = transfer._bundle_store.resolve_manifest(ref.stage_refs[location.stage])
-    chunks = manifest['buffers'][location.member]['chunks']
+    chunks = manifest["buffers"][location.member]["chunks"]
     assert len(chunks) > 1
-    assert max(chunk['bytes'] for chunk in chunks) <= chunk_bytes
-    expected = source if rows is None else source[rows]
+    assert max(chunk["bytes"] for chunk in chunks) <= chunk_bytes
+    expected = (source if rows is None else source[rows]).cpu()
     target = aligned_tensor(expected.shape)
-    result = transfer.get(ref, type='dict', rows=rows,
-        destinations={'value': tensor_destination(target, alignment=64, pre_registered=True)})
-    assert result['value'] is target
+    result = transfer.get(
+        ref,
+        type="dict",
+        rows=rows,
+        destinations={
+            "value": tensor_destination(target, alignment=64, pre_registered=True)
+        },
+    )
+    assert result["value"] is target
     torch.testing.assert_close(target, expected)
     assert store.get_tensor_calls == 0
 
 
-@pytest.mark.parametrize('mode', ['copy', 'auto'])
+def test_registered_gpu_source_rejects_missing_registration_and_cleans_header():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    store, transfer = make_transfer(BoundedPayloadStore())
+    source = torch.arange(1024, device="cuda", dtype=torch.int32)
+    store.device_source = (source, source.cpu())
+    store.strict_put_calls = 0
+    with pytest.raises(RuntimeError, match="require_direct=True"):
+        transfer.put(
+            {"value": source},
+            type="dict",
+            chunk_bytes=128,
+            policy=BundleTransferPolicy(copy_mode="auto"),
+            field_schemas={
+                "value": FieldSchema(codec="torch_tensor", direct_alignment=64)
+            },
+        )
+    assert not store.objects
+    assert not store.registered
+
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
 def test_ordinary_tensor_keeps_single_object_storage(mode):
     store, transfer = make_transfer(DirectStore())
     source = torch.arange(6144, dtype=torch.int32).view(3, 2, 1024)
-    ref = transfer.put({'value': source}, type='dict', chunk_bytes=4096,
+    ref = transfer.put(
+        {"value": source},
+        type="dict",
+        chunk_bytes=4096,
         policy=BundleTransferPolicy(copy_mode=mode),
-        field_schemas={'value': FieldSchema(codec='torch_tensor')})
-    location = ref.field_index['value']
+        field_schemas={"value": FieldSchema(codec="torch_tensor")},
+    )
+    location = ref.field_index["value"]
     manifest = transfer._bundle_store.resolve_manifest(ref.stage_refs[location.stage])
-    assert len(manifest['buffers'][location.member]['chunks']) == 1
-    torch.testing.assert_close(transfer.get(ref, type='dict')['value'], source)
+    assert len(manifest["buffers"][location.member]["chunks"]) == 1
+    torch.testing.assert_close(transfer.get(ref, type="dict")["value"], source)
 
 
 def test_copy_chunks_are_assembled_on_demand_and_cleaned_on_failure():
@@ -404,27 +468,31 @@ def test_copy_chunks_are_assembled_on_demand_and_cleaned_on_failure():
             self.index, self.fail = index, fail
 
         def __iter__(self):
-            events.append(('copy', self.index))
+            events.append(("copy", self.index))
             if self.fail:
-                raise MemoryError('injected next-chunk allocation failure')
-            return iter([memoryview(b'payload')])
+                raise MemoryError("injected next-chunk allocation failure")
+            return iter([memoryview(b"payload")])
 
     class Store(DirectStore):
         def put(self, key, value, config=None):
-            events.append(('put', key))
+            events.append(("put", key))
             return super().put(key, value, config=config)
 
     store = Store()
     transport = _MooncakePayloadTransport(store)
     transport.put_multi_buffer_payload_chunks(
-        ['first', 'second'], [ObservedGroup(0), ObservedGroup(1)],
-        BundleTransferPolicy(copy_mode='copy'))
-    assert events == [('copy', 0), ('put', 'first'), ('copy', 1), ('put', 'second')]
+        ["first", "second"],
+        [ObservedGroup(0), ObservedGroup(1)],
+        BundleTransferPolicy(copy_mode="copy"),
+    )
+    assert events == [("copy", 0), ("put", "first"), ("copy", 1), ("put", "second")]
     store.objects.clear()
     events.clear()
-    with pytest.raises(MemoryError, match='next-chunk'):
+    with pytest.raises(MemoryError, match="next-chunk"):
         transport.put_multi_buffer_payload_chunks(
-            ['first', 'second'], [ObservedGroup(0), ObservedGroup(1, fail=True)],
-            BundleTransferPolicy(copy_mode='copy'))
+            ["first", "second"],
+            [ObservedGroup(0), ObservedGroup(1, fail=True)],
+            BundleTransferPolicy(copy_mode="copy"),
+        )
     assert store.objects == {}
-    assert events == [('copy', 0), ('put', 'first'), ('copy', 1)]
+    assert events == [("copy", 0), ("put", "first"), ("copy", 1)]

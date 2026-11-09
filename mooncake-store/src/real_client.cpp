@@ -5836,6 +5836,23 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     return {};
 }
 
+int RealClient::put_from_direct(const std::string &key, void *buffer,
+                                size_t size, const ReplicateConfig &config) {
+    if (!client_ || config.prefer_alloc_in_same_node) {
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_->SupportsStrictDirectRead()) {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
+    if (size == 0) return 0;
+    const auto region = resolve_writable_buffer_region(buffer);
+    if (!region || size > region->size - region->offset) {
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+    auto slices = split_into_slices(buffer, size);
+    return to_py_ret(client_->Put(key, slices, config, true));
+}
+
 int RealClient::put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config) {
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(

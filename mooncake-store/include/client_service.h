@@ -306,6 +306,13 @@ class Client {
                                       std::vector<Slice>& slices,
                                       const ReplicateConfig& config);
 
+    // Strict registered-source writes use classic RDMA and physically drain
+    // before returning, including errors. The ordinary Put ABI is unchanged.
+    tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                      std::vector<Slice>& slices,
+                                      const ReplicateConfig& config,
+                                      bool require_direct);
+
     /**
      * @brief Batch put data with replication
      * @param keys Object keys
@@ -1003,6 +1010,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    bool CanTransferDirectMemory(const Replica::Descriptor& replica,
+                                 bool registered, bool allow_nvlink) const;
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

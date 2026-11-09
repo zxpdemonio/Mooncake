@@ -224,6 +224,10 @@ class RealClient : public PyClient {
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
 
+    // Caller owns registration and keeps the source alive until return.
+    int put_from_direct(const std::string &key, void *buffer, size_t size,
+                        const ReplicateConfig &config = ReplicateConfig{});
+
     /**
      * @brief Put one object directly from a registered data buffer plus a
      * registered metadata buffer

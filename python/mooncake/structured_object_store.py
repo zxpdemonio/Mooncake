@@ -96,7 +96,11 @@ class FieldSchema:
     ``metadata["section"]`` may pin a field to ``batch``,
     ``non_tensor_batch``, or ``meta_info``.
     ``direct_alignment`` opts a dense tensor member into strict direct reads;
-    omitting it preserves ordinary materialization.
+    omitting it preserves ordinary materialization. With ``copy_mode="auto"``,
+    a contiguous CUDA source uses strict registered-source RDMA PUT. The caller
+    must register its complete source range and keep it unmodified and alive
+    through PUT. Unsupported native backends fail rather than staging it.
+    Non-contiguous device sources and ``copy`` may use a host snapshot.
     """
 
     codec: str
@@ -4558,13 +4562,25 @@ class _BundleManifestStore:
             }, [key]
         if (
             value.direct_alignment is not None
-            and value.tensor.device.type == "cpu"
+            and transfer_policy.copy_mode == "auto"
+            and value.tensor.device.type == "cuda"
+            and value.tensor.is_contiguous()
+        ):
+            # The caller owns the device allocation and its registration.
+            return self._transport.put_registered_device_tensor(
+                key, value, chunk_bytes, config
+            )
+        if (
+            value.direct_alignment is not None
             and transfer_policy.copy_mode != "zero_copy"
             and value.tensor.nbytes + _tensor_metadata_size() > chunk_bytes
         ):
-            # Reuse byte chunks without first concatenating a whole tensor.
-            # The owner retains any contiguous copy made by the native codec.
-            metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
+            # Host byte chunks need a CPU snapshot for device sources. Retain
+            # the codec owner, including any contiguous copy, through the PUT.
+            # This bounds storage objects without concatenating the tensor.
+            metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(
+                value, host_access=True
+            )
             data = (ctypes.c_ubyte * tensor_nbytes).from_address(data_ptr)
             payload_spec, payload_keys = self._put_multi_buffer_payload(
                 key,
@@ -5263,6 +5279,57 @@ class _MooncakePayloadTransport:
         )
         _ = value.owner
         return value.size
+
+    def put_registered_device_tensor(
+        self,
+        key: str,
+        value: _TensorPayload,
+        chunk_bytes: int,
+        config: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        put_from = getattr(self._store, "put_from", None)
+        if not callable(put_from):
+            raise RuntimeError("registered device PUT requires native put_from")
+        metadata, ptr, nbytes, owner = _tensor_payload_parts(value)
+        if ptr != value.tensor.data_ptr() or nbytes != value.tensor.nbytes:
+            raise ValueError(
+                "registered device PUT requires the original contiguous source"
+            )
+        # Complete producer work, including any caller-side contiguous copy,
+        # before the external RDMA reader accesses the source allocation.
+        _torch.cuda.current_stream(value.tensor.device).synchronize()
+        headers = _split_view(memoryview(metadata), chunk_bytes)
+        sizes = [len(part) for part in headers]
+        sizes.extend(
+            min(chunk_bytes, nbytes - offset)
+            for offset in range(0, nbytes, chunk_bytes)
+        )
+        keys = [f"{key}/chunk/{index}" for index in range(len(sizes))]
+        options = {"require_direct": True}
+        if config is not None:
+            options["config"] = _config_for_grouped_keys(config, 1)
+        try:
+            self._put_chunks_direct(keys[: len(headers)], headers, config)
+            offset = 0
+            for chunk_key, size in zip(keys[len(headers) :], sizes[len(headers) :]):
+                _check_status(
+                    put_from(chunk_key, ptr + offset, size, **options),
+                    "put_from(require_direct=True)",
+                    chunk_key,
+                )
+                offset += size
+        except BaseException:
+            _cleanup_keys(self._store, keys, strict=False)
+            raise
+        # The native strict call drains on success and failure. Registration
+        # remains the caller's; keep the actual codec owner through all calls.
+        _ = owner
+        return {
+            "key": key,
+            "bytes": len(metadata) + nbytes,
+            "metadata_bytes": len(metadata),
+            "chunks": [{"key": k, "bytes": size} for k, size in zip(keys, sizes)],
+        }, keys
 
     def put_tensor_payload_direct(
         self,
