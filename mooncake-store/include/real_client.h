@@ -20,7 +20,7 @@
 #include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
 #include "client_service.h"
-#include "device/cuda_ipc_buffer_handle.h"
+#include "device/cuda_ipc_buffer.h"
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
@@ -598,6 +598,11 @@ class RealClient : public PyClient {
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
 
+    tl::expected<void, ErrorCode> register_cuda_ipc_buffer(
+        CudaIpcBufferHandle handle, const UUID &client_id);
+    tl::expected<void, ErrorCode> unregister_cuda_ipc_buffer(
+        CudaIpcBufferHandle handle, const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>>
     batch_upsert_from_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -1075,6 +1080,17 @@ class RealClient : public PyClient {
     batch_write_from_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
+
+    using CudaIpcMappingPtr = std::shared_ptr<device::CudaIpcBufferMapping>;
+    tl::expected<CudaIpcMappingPtr, ErrorCode> AcquireCudaIpcMapping(
+        const CudaIpcBufferHandle &handle, const UUID &client_id);
+    void ReleaseCudaIpcMappings(const UUID &client_id);
+
+    std::mutex cuda_ipc_mutex_;
+    std::unordered_map<UUID,
+                       std::unordered_map<std::string, CudaIpcMappingPtr>,
+                       boost::hash<UUID>>
+        cuda_ipc_mappings_;
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 

@@ -2099,6 +2099,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
         shm_it = shm_contexts_.erase(shm_it);
     }
+    {
+        std::lock_guard<std::mutex> cuda_ipc_lock(cuda_ipc_mutex_);
+        cuda_ipc_mappings_.clear();
+    }
     // Re-attempt quarantined segments (unregister failed during this teardown
     // or an earlier one). Failures stay pinned (never munmapped) until process
     // exit, and are reported so teardown does not claim success while
@@ -3508,6 +3512,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    ReleaseCudaIpcMappings(client_id);
     if (failed) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -6423,6 +6428,67 @@ RealClient::batch_put_from_cuda_ipc_dummy_helper(
                                                   false);
 }
 
+namespace {
+
+std::string cuda_ipc_handle_key(const CudaIpcBufferHandle &handle) {
+    return std::string(reinterpret_cast<const char *>(handle.handle.data()),
+                       handle.handle.size());
+}
+
+bool cuda_ipc_range_fits(uint64_t offset, uint64_t size,
+                         size_t allocation_size) {
+    return size != 0 && offset <= allocation_size &&
+           size <= allocation_size - offset;
+}
+
+}  // namespace
+
+tl::expected<RealClient::CudaIpcMappingPtr, ErrorCode>
+RealClient::AcquireCudaIpcMapping(const CudaIpcBufferHandle &handle,
+                                  const UUID &client_id) {
+    const std::string key = cuda_ipc_handle_key(handle);
+    std::lock_guard<std::mutex> lock(cuda_ipc_mutex_);
+    auto client_it = cuda_ipc_mappings_.find(client_id);
+    if (client_it != cuda_ipc_mappings_.end()) {
+        auto mapping_it = client_it->second.find(key);
+        if (mapping_it != client_it->second.end()) return mapping_it->second;
+    }
+
+    auto opened = device::CudaIpcBufferMapping::OpenAllocation(handle);
+    if (!opened.has_value()) return tl::unexpected(opened.error());
+    auto mapping =
+        std::make_shared<device::CudaIpcBufferMapping>(std::move(*opened));
+    cuda_ipc_mappings_[client_id].emplace(key, mapping);
+    return mapping;
+}
+
+void RealClient::ReleaseCudaIpcMappings(const UUID &client_id) {
+    std::lock_guard<std::mutex> lock(cuda_ipc_mutex_);
+    cuda_ipc_mappings_.erase(client_id);
+}
+
+tl::expected<void, ErrorCode> RealClient::register_cuda_ipc_buffer(
+    CudaIpcBufferHandle handle, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto mapping = AcquireCudaIpcMapping(handle, client_id);
+    if (!mapping.has_value()) return tl::unexpected(mapping.error());
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::unregister_cuda_ipc_buffer(
+    CudaIpcBufferHandle handle, const UUID &client_id) {
+    const std::string key = cuda_ipc_handle_key(handle);
+    std::lock_guard<std::mutex> lock(cuda_ipc_mutex_);
+    auto client_it = cuda_ipc_mappings_.find(client_id);
+    if (client_it == cuda_ipc_mappings_.end()) return {};
+    client_it->second.erase(key);
+    if (client_it->second.empty()) cuda_ipc_mappings_.erase(client_it);
+    return {};
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_upsert_from_cuda_ipc_dummy_helper(
     const std::vector<CudaIpcWriteRequest> &requests,
@@ -6454,7 +6520,7 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
         }
     }
 
-    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<CudaIpcMappingPtr> payload_mappings;
     std::vector<std::string> keys;
     std::vector<std::vector<void *>> all_buffers;
     std::vector<std::vector<size_t>> all_sizes;
@@ -6465,13 +6531,19 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
 
     const MappedShm *last_hit_shm = nullptr;
     for (const auto &request : requests) {
-        auto mapping = device::CudaIpcBufferMapping::Open(request.payload);
+        auto mapping = AcquireCudaIpcMapping(request.payload, client_id);
         if (!mapping) {
             return std::vector<tl::expected<void, ErrorCode>>(
                 requests.size(), tl::unexpected(mapping.error()));
         }
+        if (!cuda_ipc_range_fits(request.payload.offset, request.payload.size,
+                                 (*mapping)->allocation_size())) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        void *payload_ptr =
+            static_cast<char *>((*mapping)->base()) + request.payload.offset;
         payload_mappings.push_back(std::move(*mapping));
-        void *payload_ptr = payload_mappings.back().ptr();
         keys.push_back(request.key);
         if (has_metadata) {
             void *metadata_ptr = nullptr;
@@ -6507,13 +6579,11 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_cuda_ipc_dummy_helper(
     const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id) {
-    {
-        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
-            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-            return std::vector<tl::expected<int64_t, ErrorCode>>(
-                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
     std::vector<tl::expected<int64_t, ErrorCode>> results(
@@ -6525,14 +6595,23 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
             results[i] = 0;
             continue;
         }
-        auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
+        auto mapping = AcquireCudaIpcMapping(request.destination, client_id);
         if (!mapping) {
             results[i] = tl::unexpected(mapping.error());
             continue;
         }
+        if (!cuda_ipc_range_fits(request.destination.offset,
+                                 request.destination.size,
+                                 (*mapping)->allocation_size()) ||
+            request.size > request.destination.size) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
         results[i] = get_into_range_internal(
-            request.key, mapping->ptr(), 0,
-            static_cast<size_t>(request.source_offset),
+            request.key,
+            static_cast<char *>((*mapping)->base()) +
+                request.destination.offset,
+            0, static_cast<size_t>(request.source_offset),
             static_cast<size_t>(request.size), false, false);
     }
     return results;

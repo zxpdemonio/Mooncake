@@ -235,8 +235,10 @@ class DummyClient : public PyClient {
     bool is_dummy_shm_buffer(void *buffer, size_t size) const;
     std::optional<size_t> external_buffer_remaining(void *buffer) const;
     bool is_registered_buffer(void *buffer, size_t size) const;
-    int register_external_buffer(void *buffer, size_t size);
-    int unregister_external_buffer(void *buffer);
+    int register_external_buffer(void *buffer, size_t size,
+                                 bool sync_cuda_ipc = false);
+    int unregister_external_buffer(void *buffer, bool sync_cuda_ipc = false);
+    void sync_cuda_ipc_mapping(void *buffer, bool open);
 #if defined(USE_ASCEND_DIRECT)
     std::optional<size_t> registered_ascend_buffer_remaining(
         void *buffer) const;

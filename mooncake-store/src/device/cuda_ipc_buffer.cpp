@@ -83,6 +83,53 @@ CUresult GetCudaAllocationRange(CUdeviceptr *base, size_t *size,
     if (fn == nullptr) return CUDA_ERROR_NOT_FOUND;
     return fn(base, size, ptr);
 }
+
+tl::expected<void *, ErrorCode> OpenIpcAllocation(
+    const CudaIpcBufferHandle &handle, size_t *allocation_size,
+    int32_t *device_id, uint64_t required_extent) {
+    static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
+                  "Unexpected CUDA IPC handle size");
+
+    auto resolved_device = ResolveCudaDevice(handle);
+    if (!resolved_device.has_value()) {
+        return tl::unexpected(resolved_device.error());
+    }
+
+    int current_device = -1;
+    cudaGetDevice(&current_device);
+    if (cudaSetDevice(*resolved_device) != cudaSuccess) {
+        ClearCudaError();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    cudaIpcMemHandle_t ipc_handle{};
+    std::memcpy(&ipc_handle, handle.handle.data(), sizeof(ipc_handle));
+
+    void *base = nullptr;
+    cudaError_t ret =
+        cudaIpcOpenMemHandle(&base, ipc_handle, cudaIpcMemLazyEnablePeerAccess);
+    CUdeviceptr range_base = 0;
+    size_t range_size = 0;
+    if (ret == cudaSuccess && base != nullptr) {
+        CUresult cu_ret =
+            GetCudaAllocationRange(&range_base, &range_size, (CUdeviceptr)base);
+        if (cu_ret != CUDA_SUCCESS || range_base != (CUdeviceptr)base ||
+            range_size == 0 || required_extent > range_size) {
+            cudaIpcCloseMemHandle(base);
+            base = nullptr;
+            ret = cudaErrorInvalidValue;
+        }
+    }
+    if (current_device >= 0) cudaSetDevice(current_device);
+    if (ret != cudaSuccess || base == nullptr) {
+        ClearCudaError();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    *allocation_size = range_size;
+    *device_id = *resolved_device;
+    return base;
+}
 #endif
 
 }  // namespace
@@ -199,7 +246,8 @@ CudaIpcBufferMapping::CudaIpcBufferMapping(
     CudaIpcBufferMapping &&other) noexcept
     : base_(std::exchange(other.base_, nullptr)),
       ptr_(std::exchange(other.ptr_, nullptr)),
-      device_id_(std::exchange(other.device_id_, -1)) {}
+      device_id_(std::exchange(other.device_id_, -1)),
+      allocation_size_(std::exchange(other.allocation_size_, 0)) {}
 
 CudaIpcBufferMapping &CudaIpcBufferMapping::operator=(
     CudaIpcBufferMapping &&other) noexcept {
@@ -208,59 +256,42 @@ CudaIpcBufferMapping &CudaIpcBufferMapping::operator=(
         base_ = std::exchange(other.base_, nullptr);
         ptr_ = std::exchange(other.ptr_, nullptr);
         device_id_ = std::exchange(other.device_id_, -1);
+        allocation_size_ = std::exchange(other.allocation_size_, 0);
     }
     return *this;
+}
+
+tl::expected<CudaIpcBufferMapping, ErrorCode>
+CudaIpcBufferMapping::OpenAllocation(const CudaIpcBufferHandle &handle) {
+#if defined(USE_CUDA)
+    size_t allocation_size = 0;
+    int32_t device_id = -1;
+    auto opened = OpenIpcAllocation(handle, &allocation_size, &device_id, 0);
+    if (!opened.has_value()) return tl::unexpected(opened.error());
+    void *base = *opened;
+    return CudaIpcBufferMapping(base, base, device_id, allocation_size);
+#else
+    (void)handle;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
 }
 
 tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     const CudaIpcBufferHandle &handle) {
 #if defined(USE_CUDA)
-    static_assert(sizeof(cudaIpcMemHandle_t) == kCudaIpcHandleSize,
-                  "Unexpected CUDA IPC handle size");
-
     if (handle.size == 0 || AddOverflows(handle.offset, handle.size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto resolved_device = ResolveCudaDevice(handle);
-    if (!resolved_device.has_value()) {
-        return tl::unexpected(resolved_device.error());
-    }
-
-    int current_device = -1;
-    cudaGetDevice(&current_device);
-    if (cudaSetDevice(*resolved_device) != cudaSuccess) {
-        ClearCudaError();
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    cudaIpcMemHandle_t ipc_handle{};
-    std::memcpy(&ipc_handle, handle.handle.data(), sizeof(ipc_handle));
-
-    void *base = nullptr;
-    cudaError_t ret =
-        cudaIpcOpenMemHandle(&base, ipc_handle, cudaIpcMemLazyEnablePeerAccess);
-    CUdeviceptr allocation_base = 0;
     size_t allocation_size = 0;
-    if (ret == cudaSuccess && base != nullptr) {
-        CUresult cu_ret = GetCudaAllocationRange(
-            &allocation_base, &allocation_size, (CUdeviceptr)base);
-        if (cu_ret != CUDA_SUCCESS || allocation_base != (CUdeviceptr)base ||
-            allocation_size == 0 || AddOverflows(handle.offset, handle.size) ||
-            handle.offset + handle.size > allocation_size) {
-            cudaIpcCloseMemHandle(base);
-            base = nullptr;
-            ret = cudaErrorInvalidValue;
-        }
-    }
-    if (current_device >= 0) cudaSetDevice(current_device);
-    if (ret != cudaSuccess || base == nullptr) {
-        ClearCudaError();
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
+    int32_t device_id = -1;
+    auto opened = OpenIpcAllocation(handle, &allocation_size, &device_id,
+                                    handle.offset + handle.size);
+    if (!opened.has_value()) return tl::unexpected(opened.error());
+    void *base = *opened;
 
     auto *ptr = static_cast<char *>(base) + handle.offset;
-    return CudaIpcBufferMapping(base, ptr, *resolved_device);
+    return CudaIpcBufferMapping(base, ptr, device_id, allocation_size);
 #else
     (void)handle;
     return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -283,6 +314,7 @@ void CudaIpcBufferMapping::Close() {
     base_ = nullptr;
     ptr_ = nullptr;
     device_id_ = -1;
+    allocation_size_ = 0;
 }
 
 }  // namespace device

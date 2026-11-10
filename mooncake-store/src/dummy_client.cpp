@@ -717,22 +717,27 @@ DummyClient::BufferReleaseAction DummyClient::release_buffer_registration(
     return BufferReleaseAction::kRetained;
 }
 
-int DummyClient::register_external_buffer(void* buffer, size_t size) {
+int DummyClient::register_external_buffer(void* buffer, size_t size,
+                                          bool sync_cuda_ipc) {
     if (buffer == nullptr || size == 0) return -1;
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(buffer);
     if (size > std::numeric_limits<uintptr_t>::max() - base) return -1;
 
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
-    if (retain_buffer_registration(registered_external_buffers_, base, size) ==
-        BufferRegistrationAction::kReject) {
+    const auto action =
+        retain_buffer_registration(registered_external_buffers_, base, size);
+    if (action == BufferRegistrationAction::kReject) {
         LOG(ERROR) << "Invalid or overlapping external buffer registration";
         return -1;
+    }
+    if (sync_cuda_ipc && action == BufferRegistrationAction::kFirst) {
+        sync_cuda_ipc_mapping(buffer, true);
     }
     return 0;
 }
 
-int DummyClient::unregister_external_buffer(void* buffer) {
+int DummyClient::unregister_external_buffer(void* buffer, bool sync_cuda_ipc) {
     if (buffer == nullptr) return -1;
 
     std::lock_guard<std::mutex> lock(registered_external_buffers_mutex_);
@@ -740,9 +745,27 @@ int DummyClient::unregister_external_buffer(void* buffer) {
     const auto action =
         release_buffer_registration(registered_external_buffers_, base);
     if (action == BufferReleaseAction::kReject) return -1;
-    if (action == BufferReleaseAction::kFinal)
+    if (action == BufferReleaseAction::kFinal) {
+        if (sync_cuda_ipc) sync_cuda_ipc_mapping(buffer, false);
         registered_external_buffers_.erase(base);
+    }
     return 0;
+}
+
+void DummyClient::sync_cuda_ipc_mapping(void* buffer, bool open) {
+    auto payloads = try_export_cuda_ipc_buffers({buffer}, {1});
+    if (!payloads) return;
+
+    auto result =
+        open ? invoke_rpc<&RealClient::register_cuda_ipc_buffer, void>(
+                   (*payloads)[0], client_id_)
+             : invoke_rpc<&RealClient::unregister_cuda_ipc_buffer, void>(
+                   (*payloads)[0], client_id_);
+    if (!result.has_value()) {
+        LOG(WARNING) << "CUDA IPC mapping "
+                     << (open ? "registration" : "release")
+                     << " failed, buffer=" << buffer;
+    }
 }
 
 #if defined(USE_ASCEND_DIRECT)
@@ -1041,10 +1064,11 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     }
 #endif
     if (shm_helper_ == nullptr) return -1;
+    const bool device_buffer = is_device_buffer(buffer);
     auto shm = shm_helper_->get_shm(buffer);
-    if (shm && is_device_buffer(buffer)) shm = nullptr;
+    if (shm && device_buffer) shm = nullptr;
     if (!shm) {
-        return register_external_buffer(buffer, size);
+        return register_external_buffer(buffer, size, device_buffer);
     }
     if (shm_helper_->is_hugepage()) {
         const size_t alignment = get_hugepage_size_from_env();
@@ -1126,10 +1150,11 @@ int DummyClient::unregister_buffer(void* buffer) {
 #endif
 
     if (shm_helper_ == nullptr) return -1;
+    const bool device_buffer = is_device_buffer(buffer);
     auto shm = shm_helper_->get_shm(buffer);
-    if (shm && is_device_buffer(buffer)) shm = nullptr;
+    if (shm && device_buffer) shm = nullptr;
     if (!shm) {
-        return unregister_external_buffer(buffer);
+        return unregister_external_buffer(buffer, device_buffer);
     }
     if (!shm->registered) {
         LOG(ERROR) << "Buffer is not registered with RealClient";
