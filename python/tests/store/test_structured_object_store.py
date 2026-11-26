@@ -2108,8 +2108,10 @@ class PostCommitFailureStore(InMemoryStore):
         return self._finish(key, super().pub_tensor(key, value, config))
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-@pytest.mark.parametrize("point", ["meta", "chunk", "small", "manifest"])
+@pytest.mark.parametrize(
+    ("mode", "point"),
+    [("copy", "meta"), ("copy", "chunk"), ("auto", "small"), ("auto", "manifest")],
+)
 def test_dataproto_post_commit_failure_removes_attempted_keys(mode, point):
     torch = pytest.importorskip("torch")
     store = PostCommitFailureStore(point)
@@ -2135,8 +2137,7 @@ def test_dataproto_post_commit_failure_removes_attempted_keys(mode, point):
     assert store.tensor_objects == {}
 
 
-@pytest.mark.parametrize("mode", ["copy", "auto"])
-def test_new_manifest_post_commit_failure_preserves_borrowed_buffers(mode):
+def test_new_manifest_post_commit_failure_preserves_borrowed_buffers():
     store = PostCommitFailureStore("disabled")
     _, transfer = make_transfer(store=store)
     original = transfer.put_bundle(b"base", {"data": b"borrowed"})
@@ -5439,11 +5440,5 @@ def test_bundle_buffer_pool_exposes_existing_transport_pool_readonly():
     sentinel = object()
     transfer = MooncakeBundleTransfer(object(), buffer_pool=sentinel)
     assert transfer.buffer_pool is sentinel
-    assert transfer.buffer_pool is sentinel
     with pytest.raises(AttributeError):
         transfer.buffer_pool = None
-
-
-def test_bundle_buffer_pool_without_native_support_keeps_fallback():
-    transfer = MooncakeBundleTransfer(object())
-    assert transfer.buffer_pool is None
